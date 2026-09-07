@@ -53,6 +53,10 @@ jobs:
       - name: Attach artifacts to the release
         uses: softprops/action-gh-release@v2
         with:
+          # One-action release: push a v* tag — the release appears with
+          # auto-generated notes (commit history since the previous tag).
+          name: "rsv-data-router ${{ github.ref_name }}"
+          generate_release_notes: true
           files: |
             artifacts/dist/*.whl
             artifacts/dist/*.tar.gz
