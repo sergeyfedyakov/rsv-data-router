@@ -13,6 +13,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # Runner consoles are not UTF-8 (cp1252 on Windows): the smoke
+      # reports are Cyrillic, force UTF-8 or printing dies mid-run.
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
