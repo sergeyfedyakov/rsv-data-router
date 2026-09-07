@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsv-data-router"
+description = "MCP-роутер RSVData: одна точка входа на несколько баз 1С"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "fastmcp>=4.0",
+    "platformdirs>=4.0",
+    "keyring>=25",
+]
+
+[project.scripts]
+rsv-data-router = "rsv_data_router.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "rsv_data_router.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

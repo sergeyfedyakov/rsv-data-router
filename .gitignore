@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.spec
+entry.py
+.venv/
+.pytest_cache/
+
+# Runtime / local state (logs, test homes — never publish)
+*.log
+.test-home/
+.smoke-home/
+.test-edt/
+
+# Project knowledge (local only, not part of the public repo)
+.ai/
+
+# Local-only artifacts
+bin/
+tests/spike_gilev.py

@@ -1,0 +1,59 @@
+name: Build artifacts
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build sdist + wheel
+        run: |
+          pip install build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install build deps
+        run: pip install -e . pyinstaller
+      - name: Build single-file exe
+        run: |
+          python -c "open('entry.py','w',encoding='utf-8').write('import sys\nfrom rsv_data_router.cli import main\nsys.exit(main())')"
+          pyinstaller --noconfirm --onefile --name rsv-data-router --paths src --collect-all fastmcp entry.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsv-data-router-win64
+          path: dist/rsv-data-router.exe
+
+  release:
+    needs: [wheel, exe]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Attach artifacts to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/dist/*.whl
+            artifacts/dist/*.tar.gz
+            artifacts/rsv-data-router-win64/rsv-data-router.exe
