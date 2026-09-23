@@ -1,7 +1,7 @@
 """Stage-13 acceptance checks: platform sources + launch preflight.
 
 Offline (no network): the explicit per-target platform key parsing
-(version vs 1cv8.exe path), the auto-sources-win-over-key priority, and
+(version vs 1cv8.exe path), the explicit-version-over-ibases priority, and
 the preflight decision matrix that decides BEFORE an install/removal job
 starts whether any chain variant can work at all (fail-fast — the
 live-case lesson): for installs also the RSVData binary itself (no
@@ -137,22 +137,45 @@ def run_sync(url=None, home=None, ports=None, verbose=True):
               installer._explicit_platform(make_target()) == (None, None),
               str(installer._explicit_platform(make_target())))
 
-        # Auto sources win over the operator key.
+        # Priority (user decision, 23.09): the EDT binding and the disk scan
+        # stay ABOVE the explicit key; the explicit VERSION outranks only
+        # the ibases.v8i sources.
         stage8_check.make_project(home, "Proj13", UUID13,
                                   binding=[(UUID13, "8.3.27.2214")])
         with open(os.environ["RSV_DATA_ROUTER_IBASES"], "w",
                   encoding="utf-8-sig") as handle:
             handle.write(f"[База тринадцать]\nID={UUID13}\n"
                          'Connect=Srvr="127.0.0.1:1541";Ref="ours";\n'
-                         "DefaultVersion=8.3.27.2214\n")
+                         "Version=8.3.27.2214\n")
         linked = make_target(edt={"workspace": home, "project": "Proj13"},
-                             platform="8.5.9.9999")
-        check("priority: auto binding wins over the platform key",
+                             platform="8.5.1.1423")
+        check("priority: EDT binding still answers over the key",
               update_designer.base_platform_version(linked) == "8.3.27.2214",
               update_designer.base_platform_version(linked))
+        check("priority: _designer_for keeps the EDT binding",
+              installer._designer_for(linked)[1] == "8.3.27.2214",
+              str(installer._designer_for(linked)))
         check("priority: the key itself still readable",
-              installer._explicit_platform(linked) == (None, "8.5.9.9999"),
+              installer._explicit_platform(linked) == (None, "8.5.1.1423"),
               str(installer._explicit_platform(linked)))
+
+        # Standalone ibases.v8i Version (matched by Srvr/Ref, no EDT link,
+        # empty scan registry) LOSES to the explicit version.
+        ibases_target = make_target(url="http://127.0.0.1:1541/ours",
+                                    platform="8.5.1.1423")
+        check("priority: ibases Version is the auto answer",
+              update_designer.base_platform_version(ibases_target)
+              == "8.3.27.2214",
+              update_designer.base_platform_version(ibases_target))
+        check("priority: ignore_ibases drops the file source",
+              update_designer.base_platform_version(
+                  ibases_target, ignore_ibases=True) is None,
+              update_designer.base_platform_version(
+                  ibases_target, ignore_ibases=True))
+        designer, used, note, refusal = installer._designer_for(ibases_target)
+        check("priority: _designer_for uses the key over ibases",
+              refusal is None and used == "8.5.1.1423",
+              f"{designer} {used} {note} {refusal}")
 
         # Preflight matrix. The endpoint answers with a version — go,
         # everything else is irrelevant.

@@ -155,10 +155,10 @@ URL_REGISTRATION_REFUSAL = (
 def _explicit_platform(target):
     """(designer_path, version) from the per-target platform key.
 
-    Operator fallback ONLY: auto resolution (update_designer.
-    base_platform_version) wins whenever it answers. A value with a path
-    separator or an .exe tail is a configurator binary; anything else is a
-    platform version.
+    A key PATH always wins. A key VERSION outranks the ibases.v8i sources
+    (user decision, 23.09) while the EDT binding and the offline workspace
+    scan stay ahead of it. A value with a path separator or an .exe tail is
+    a configurator binary; anything else is a platform version.
     """
     value = str(getattr(target, "platform", "") or "").strip()
     if not value:
@@ -171,15 +171,17 @@ def _explicit_platform(target):
 def _designer_for(target):
     """(designer, version, note, refusal) for the configurator option.
 
-    Auto sources first (EDT link -> disk scan -> ibases Version), the
-    per-target platform key last; version=None means resolve_designer may
-    fall back to the SINGLE installed platform (with a note) and refuses
+    Auto sources first (EDT link -> disk scan), then the per-target platform
+    key: a key VERSION outranks the ibases.v8i sources (user decision,
+    23.09) but not the EDT binding/scan. version=None means resolve_designer
+    may fall back to the SINGLE installed platform (with a note) and refuses
     when several are installed. refusal carries the ask-the-user text.
     """
     key_path, key_version = _explicit_platform(target)
     if key_path:
         return key_path, None, None, None
-    version = update_designer.base_platform_version(target) or key_version
+    version = update_designer.base_platform_version(
+        target, ignore_ibases=bool(key_version)) or key_version
     try:
         return (*update_designer.resolve_designer(version), None)
     except SystemExit as exc:

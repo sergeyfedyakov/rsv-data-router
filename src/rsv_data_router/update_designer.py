@@ -169,19 +169,20 @@ def find_designer(version, roots=None):
     return resolve_designer(version, roots)[0]
 
 
-def base_platform_version(target, ibases_path=None):
+def base_platform_version(target, ibases_path=None, ignore_ibases=False):
     """The base's platform version from local sources, or None.
 
     Order (user decision, 06.09): the EDT project linked in targets.json
-    (.infobase-binding, then the Version of its ibases entry) -> the
-    offline scan of every workspace the EDT starter remembers — it matches
-    the project whose association points at the same host+ref and works
-    with EDT closed (live-tested: a workspace binding answered where no
-    target link existed) -> the Version of the ibases entry
+    (.infobase-binding) -> the offline scan of every workspace the EDT
+    starter remembers — it matches the project whose association points at
+    the same host+ref and works with EDT closed (live-tested: a workspace
+    binding answered where no target link existed) -> the ibases.v8i
+    sources: the Version of the linked project's entry, then the entry
     matched by Srvr/Ref alone (the exact build from the base's own
-    parameters, the Version key). The per-target
-    platform key is the operator fallback applied by the caller only when
-    this returns None — auto resolution wins.
+    parameters, the Version key). ignore_ibases=True drops BOTH ibases.v8i
+    sources (user decision, 23.09): the caller holds an explicit per-target
+    platform version, which then outranks the file, while .infobase-binding
+    and the scan still win.
     """
     link = target.edt or {}
     workspace, project = link.get("workspace"), link.get("project")
@@ -190,7 +191,7 @@ def base_platform_version(target, ibases_path=None):
         version = edt.infobase_version(workspace, project, uuid)
         if version:
             return version
-        if uuid:
+        if uuid and not ignore_ibases:
             try:
                 entry = edt.read_ibases(
                     ibases_path or edt.default_ibases_path()).get(uuid)
@@ -202,6 +203,8 @@ def base_platform_version(target, ibases_path=None):
     hit = edt.scan_platform_versions(ibases_path=ibases_path).get(key)
     if hit:
         return hit["version"]
+    if ignore_ibases:
+        return None
     return edt.ibases_version(key, ibases_path=ibases_path)
 
 
