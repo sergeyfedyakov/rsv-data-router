@@ -232,7 +232,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
 
             for alias in ("s7up", "s7old", "s7auth", "s7nosvc", "s7dead",
                           "s7key", "s7nc"):
-                await call(client, "unregister_target", {"base": alias})
+                await call(client, "unregister_target",
+                           {"base": alias, "uninstall": False})
             _err, _ = await call(client, "ping", {"base": "s7up"})
             check("cleanup: stage-7 targets removed",
                   _err and "не зарегистрирована" in _err, _err)

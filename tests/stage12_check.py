@@ -271,7 +271,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
 
             # Cleanup.
             for alias in ("s12slow", "s12pf", "smoke_ref", "s12conn"):
-                await call(client, "unregister_target", {"base": alias})
+                await call(client, "unregister_target",
+                           {"base": alias, "uninstall": False})
             _e, _ = await call(client, "ping", {"base": "s12slow"})
             check("cleanup: stage-12 targets removed",
                   _e and "не зарегистрирована" in _e, _e)

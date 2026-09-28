@@ -12,6 +12,7 @@ import contextlib
 import io
 import os
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if os.path.join(ROOT, "src") not in sys.path:
@@ -114,7 +115,7 @@ def run_sync(url=None, home=None, ports=None, verbose=True):
         # -- cli: --version and unknown-safe dispatch to serve --
         with contextlib.redirect_stdout(io.StringIO()) as vout:
             check("cli --version exits 0", cli.main(["--version"]) == 0)
-        check("cli --version prints 0.10.1", "0.10.1" in vout.getvalue(),
+        check("cli --version prints 0.11.0", "0.11.0" in vout.getvalue(),
               vout.getvalue())
 
         # -- Target auth chain --
@@ -141,6 +142,17 @@ def run_sync(url=None, home=None, ports=None, verbose=True):
         t = make_target(auth=None)
         check("nothing stored -> no Authorization header", t.auth_headers() == {})
         check("kind: нет", t.auth_kind() == "нет")
+
+        # -- TargetsStore.unregister drops the record AND its keyring entry --
+        with tempfile.TemporaryDirectory() as home:
+            store = targets_mod.TargetsStore(home)
+            store.register("s14", "http://127.0.0.1:9/x")
+            credentials.set_value("s14", key)
+            store.unregister("s14")
+            check("unregister drops the keyring entry",
+                  credentials.get_value("s14") is None
+                  and "s14" not in store.aliases(),
+                  f"{credentials.get_value('s14')!r} {store.aliases()}")
 
         # -- basic_header shapes: all normalize to the same Basic key --
         expected = "Basic " + inline

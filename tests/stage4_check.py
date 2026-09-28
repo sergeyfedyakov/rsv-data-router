@@ -339,7 +339,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
 
         # Clean up stage-4 targets so later stages / reruns start clean.
         for alias in ("smoke_ref", "conn_ref", "old_url", "cwd_bind", "cwd_bind2"):
-            await call(client, "unregister_target", {"base": alias})
+            await call(client, "unregister_target",
+                       {"base": alias, "uninstall": False})
         remaining = set(load_cfg()["targets"])
         check("after cleanup: stage-4 targets unregistered",
               not {"smoke_ref", "conn_ref", "old_url", "cwd_bind",

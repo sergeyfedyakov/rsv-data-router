@@ -256,6 +256,12 @@ class TargetsStore:
             return target, existing is not None
 
     def unregister(self, alias):
+        """Drop the record AND its keyring entry (best-effort).
+
+        The record owns the secret: removing the target removes the alias's
+        key too, so a stale key never outlives its record. An absent entry or
+        an unusable backend is not an error (delete_value returns False).
+        """
         with self._lock:
             self._maybe_reload()
             target = self._targets.pop(alias, None)
@@ -263,6 +269,7 @@ class TargetsStore:
                 available = ", ".join(self._targets) or "—"
                 raise TargetError(f"База «{alias}» не зарегистрирована. Доступные: {available}")
             self._save()
+            credentials.delete_value(alias)
             return target
 
     # -- internals --

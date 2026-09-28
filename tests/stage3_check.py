@@ -164,7 +164,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
 
         # Clean up stage-3 targets so later stages / reruns start clean.
         for alias in ("mock1", "mock2"):
-            await call(client, "unregister_target", {"base": alias})
+            await call(client, "unregister_target",
+                       {"base": alias, "uninstall": False})
 
     return counters["pass"], counters["fail"]
 

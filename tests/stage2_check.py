@@ -147,14 +147,20 @@ async def run(url=None, home=None, ports=None, verbose=True):
                     check("list_targets shows keyring kind, never the value",
                           not err and "basic (keyring)" in text
                           and expected_key not in text, err or text)
+                    credentials.delete_value("kr1")
+                    err, text = await call(client, "ping", {"base": "kr1"})
+                    check("removed keyring entry -> no Authorization",
+                          not err and "auth=none" in text, err or text)
+                    # Unregister deletes the record AND its keyring entry.
+                    credentials.set_value("kr1", expected_key)
+                    err, text = await call(client, "unregister_target",
+                                           {"base": "kr1", "uninstall": False})
+                    check("kr1 unregistered (cleanup for later stages)",
+                          not err, err or text)
+                    check("unregister removed the keyring entry",
+                          credentials.get_value("kr1") is None)
                 finally:
                     credentials.delete_value("kr1")
-                err, text = await call(client, "ping", {"base": "kr1"})
-                check("removed keyring entry -> no Authorization",
-                      not err and "auth=none" in text, err or text)
-                err, text = await call(client, "unregister_target", {"base": "kr1"})
-                check("kr1 unregistered (cleanup for later stages)",
-                      not err, err or text)
 
         err, text = await call(client, "register_target", {
             "url": f"http://127.0.0.1:{p1}/mcp", "base": "mock1", "comment": "обновлён"})
@@ -174,7 +180,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
         check("deleted auth section -> no Authorization",
               not err and f"mock{p1}/ping auth=none" in text, err or text)
 
-        err, text = await call(client, "unregister_target", {"base": "mock2"})
+        err, text = await call(client, "unregister_target",
+                               {"base": "mock2", "uninstall": False})
         cfg = load_cfg()
         check("unregister mock2",
               not err and "удалена" in text and "mock2" not in cfg["targets"], text or err)
@@ -189,7 +196,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
         err, text = await call(client, "list_targets", {"check": True})
         check("list_targets check pings", not err and "mock1: ок" in text, err or text)
 
-        err, text = await call(client, "unregister_target", {"base": "mock1"})
+        err, text = await call(client, "unregister_target",
+                               {"base": "mock1", "uninstall": False})
         check("cleanup: stage-2 targets unregistered",
               not err and not load_cfg()["targets"], text or err)
 

@@ -38,8 +38,9 @@ def cmd_set_secret(argv):
 def cmd_remove_secret(argv):
     parser = argparse.ArgumentParser(
         prog="rsv-data-router remove-secret",
-        description="Удалить ключ цели из keyring ОС. Записи targets.json "
-                    "это не трогает; unregister_target ключ тоже не удаляет.")
+        description="Удалить ключ цели из keyring ОС, не трогая запись в "
+                    "targets.json. Удаление самой цели (unregister_target) "
+                    "снимает и ключ.")
     parser.add_argument("alias", help="алиас цели")
     args = parser.parse_args(argv)
     if credentials.delete_value(args.alias):

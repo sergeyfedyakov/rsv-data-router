@@ -779,12 +779,14 @@ def register_tools(app, ctx):
         return "\n".join(lines)
 
     @app.tool(name="unregister_target")
-    async def unregister_target(base: str, uninstall: bool = False,
+    async def unregister_target(base: str, uninstall: bool = True,
                                 platform: str | None = None) -> str:
         """Удаление цели из мапы роутера.
 
-        uninstall=true — перед удалением записи удалить с базы расширение
-        RSVData. Порядок — зеркало установки register_target(install=true),
+        ПО УМОЛЧАНИЮ (uninstall=true) перед удалением записи снять с базы
+        расширение RSVData — обычный сценарий «свернуть базу»; uninstall=false
+        удаляет только запись, базу не трогает.
+        Порядок — зеркало установки register_target(install=true),
         но точка /remove первая:
           1) /remove (расширение 1.3.6+): динамическое удаление, монопольный
              режим не нужен; «отключено» (базу держат сеансы, удалить сейчас
@@ -815,17 +817,24 @@ def register_tools(app, ctx):
         шаг. Сразу после «удалено» пул HTTP-сеансов ~25–30 с дорабатывает
         старым кодом: запросы к базе отвечают 500 «Расширение RSVData не
         найдено», затем 404 — это норма, а не ошибка удаления.
-        uninstall=false (по умолчанию) — просто удалить запись, базу не
-        трогать.
+        uninstall=false — просто удалить запись, базу не трогать.
+        В ЛЮБОМ случае удаление записи из мапы удаляет и ключ цели из keyring
+        ОС (если он там был): запись и её секрет живут/умирают вместе. При
+        отказе предпроверки или неудачной цепочке запись и ключ СОХРАНЯЮТСЯ —
+        креды нужны для повторной попытки.
         """
         target = ctx.store.get(base)
         if target is None:
             available = ", ".join(ctx.store.aliases()) or "—"
             raise RuntimeError(f"База «{base}» не зарегистрирована. Доступные: {available}")
+        had_key = target.auth_kind() == "basic (keyring)"
         if not uninstall:
             ctx.store.unregister(base)
             ctx.log.write(f"unregister_target -> {base}: удалена")
-            return f"Цель «{base}» удалена."
+            lines = [f"Цель «{base}» удалена."]
+            if had_key:
+                lines.append("Ключ цели удалён из keyring ОС.")
+            return "\n".join(lines)
         if platform and not target.platform:
             target.platform = platform  # hint for this attempt only
         clash = ctx.jobs.running(base)
@@ -850,6 +859,8 @@ def register_tools(app, ctx):
                     except TargetError:
                         pass  # unregistered concurrently — the goal state holds
                     job.append(f"Запись цели «{base}» удалена из мапы роутера.")
+                    if had_key:
+                        job.append("Ключ цели удалён из keyring ОС.")
                     ctx.log.write(f"job -> {base}: расширение удалено/отключено, "
                                   "запись удалена")
                 else:
@@ -865,7 +876,8 @@ def register_tools(app, ctx):
                 f"Статус и построчный отчёт: job_status(job_id=\"{job.id}\") — "
                 "опрашивайте через 20–30 с; по завершении запись цели будет "
                 "удалена автоматически («удалено»/«отключено»/«расширения не "
-                "было») или сохранена с причиной и следующим шагом.")
+                "было») вместе с ключом из keyring, либо сохранена с причиной "
+                "и следующим шагом.")
 
     @app.tool(name="list_targets")
     def list_targets(check: bool = False) -> str:

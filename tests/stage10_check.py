@@ -6,8 +6,9 @@ smoke) -> configurator (bogus binary in smoke). The endpoint answers
 404 means an extension older than 1.3.6. удалено/отключено — the target
 record is deleted; anything else falls through to EDT/configurator and,
 when they can't run either, the record STAYS with the reason and the next
-step. Plain unregister_target (no uninstall) keeps its old one-line
-behavior.
+step. unregister_target defaults to uninstall=True (the chain runs even
+without the flag); uninstall=False keeps the old one-line "record only"
+behavior, and dropping the record drops its keyring entry too.
 
 Needs a router launched with --rsvmcp "" and sandboxed env sources (the
 smoke launcher sets both): SMOKE_URL (default http://127.0.0.1:8787/mcp),
@@ -109,12 +110,13 @@ async def run(url=None, home=None, ports=None, verbose=True):
         except ToolError as exc:
             return str(exc), None
 
-    async def uninstall_and_wait(client, base, timeout_s=30):
-        """uninstall=True now runs as a background job: the call answers
-        at once with a job id, the chain report (and the record fate)
-        arrives via job_status polls."""
-        _err, text = await call(client, "unregister_target",
-                                {"base": base, "uninstall": True})
+    async def uninstall_and_wait(client, base, timeout_s=30, args=None):
+        """The chain (default uninstall=True) runs as a background job: the
+        call answers at once with a job id, the chain report (and the record
+        fate) arrives via job_status polls. args overrides the payload (e.g.
+        {"base": base} to exercise the DEFAULT uninstall=True)."""
+        payload = args if args is not None else {"base": base, "uninstall": True}
+        _err, text = await call(client, "unregister_target", payload)
         match = re.search(r"id задания ([0-9a-f]+)", text or "")
         if _err or not match:
             return _err, text
@@ -211,15 +213,26 @@ async def run(url=None, home=None, ports=None, verbose=True):
                   _err is None and "s10dead" in (text or ""), _err or text)
 
             state["remove"] = "ok"
+            await call(client, "register_target", {"url": sb, "base": "s10def",
+                                                   "check": False})
+            _err, text = await uninstall_and_wait(client, "s10def",
+                                                  args={"base": "s10def"})
+            check("default (no uninstall flag): removal chain runs",
+                  _err is None and "Расширение удалено через /remove" in text
+                  and "Запись цели «s10def» удалена из мапы" in text, _err or text)
+
+            state["remove"] = "ok"
             await call(client, "register_target", {"url": sb, "base": "s10plain",
                                                    "check": False})
-            _err, text = await call(client, "unregister_target", {"base": "s10plain"})
-            check("plain uninstall=false: one line, no chain",
+            _err, text = await call(client, "unregister_target",
+                                    {"base": "s10plain", "uninstall": False})
+            check("plain uninstall=false (explicit): one line, no chain",
                   _err is None and "Цель «s10plain» удалена." in text
                   and "Удаление расширения" not in text, _err or text)
 
             for alias in ("s10rej", "s10old", "s10dead"):
-                await call(client, "unregister_target", {"base": alias})
+                await call(client, "unregister_target",
+                           {"base": alias, "uninstall": False})
             _err, _ = await call(client, "ping", {"base": "s10rej"})
             check("cleanup: stage-10 targets removed",
                   _err and "не зарегистрирована" in _err, _err)

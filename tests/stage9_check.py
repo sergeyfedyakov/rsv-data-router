@@ -165,7 +165,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
                   and "s9a:" not in text and "s9dead:" not in text, _err or text)
 
             for alias in ("s9a", "s9b", "s9c", "s9dead"):
-                await call(client, "unregister_target", {"base": alias})
+                await call(client, "unregister_target",
+                           {"base": alias, "uninstall": False})
             _err, _ = await call(client, "ping", {"base": "s9a"})
             check("cleanup: stage-9 targets removed",
                   _err and "не зарегистрирована" in _err, _err)

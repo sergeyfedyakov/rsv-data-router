@@ -97,7 +97,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
               err and "не зарегистрирована" in err and "help_router" in err, err)
 
         # Clean up so later stages / reruns start with a clean map.
-        err, _ = await call(client, "unregister_target", {"base": "mock1"})
+        err, _ = await call(client, "unregister_target",
+                            {"base": "mock1", "uninstall": False})
         check("cleanup: mock1 removed", not err, err)
 
     # -- http: binary served outside the /mcp branch --

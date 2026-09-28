@@ -219,7 +219,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
                   _err or text)
 
             for alias in ("err401", "err409", "skip404", "mock1"):
-                _err, _ = await call(client, "unregister_target", {"base": alias})
+                _err, _ = await call(client, "unregister_target",
+                                     {"base": alias, "uninstall": False})
             err, _ = await call(client, "ping", {"base": "err401"})
             check("cleanup: err-targets removed",
                   err and "не зарегистрирована" in err, err)
