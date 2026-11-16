@@ -29,6 +29,13 @@ for index, item in enumerate(args):
         base = args[index + 1]
 
 
+class Server(socketserver.TCPServer):
+    # The manager restarts the server on the SAME port; without
+    # allow_reuse_address the rebind dies on EADDRINUSE under posix
+    # (TIME_WAIT of the readiness-poll connections from the previous run).
+    allow_reuse_address = True
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -39,7 +46,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-socketserver.TCPServer(("127.0.0.1", port), Handler).serve_forever()
+Server(("127.0.0.1", port), Handler).serve_forever()
 '''
 
 
