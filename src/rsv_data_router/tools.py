@@ -16,15 +16,20 @@ when RSVData gains a new tool, add a wrapper here.
 
 import asyncio
 import os
+import re
+import threading
 import time
 from typing import Annotated, Any
 
-from . import edt, forward, installer, jobs, router_help
+from . import edt, forward, ibsrv, installer, jobs, router_help
 from pydantic import Field
 from .rlog import RouterLog
 from .targets import TargetError, TargetsStore, base_root
 
 CHECK_TIMEOUT_S = 20
+# Async data jobs (async_mode=true): the agent polls job_status instead of
+# holding the call, so the upstream wait can be generous.
+ASYNC_TIMEOUT_S = 1800
 
 BASIC_HELP = """Аутентификация — ключ хранится локально, в keyring ОС
 (Windows Credential Manager / Secret Service в Linux), и никогда не проходит
@@ -39,7 +44,24 @@ BASIC_HELP = """Аутентификация — ключ хранится ло�
 Перезапуск роутера не нужен: и keyring, и файл читаются при каждом вызове.
 
 База без авторизации — удалите секцию "auth" (комментариев в JSON нет),
-не задавайте keyring-запись: запросы пойдут без Authorization."""
+не задавайте keyring-запись: запросы пойдут без Authorization.
+
+Windows-аутентификация базы (0.14.0) — auth_mode="windows" в register_target
+(или "auth": {{ "type": "windows" }} в {path}, только для серверных баз):
+запросы и конфигуратор идут от учётной записи ОС процесса роутера
+(Negotiate/NTLM, конфигуратор с /WA+), ключ set-secret не нужен. Требуется
+пакет pip install rsv-data-router[windows-auth] и настройка сервера
+(публикация с Windows-аутентификацией, пользователь ИБ с «Аутентификация ОС»,
+веб-сервер и сервер 1С на одной машине)."""
+
+
+def async_job_answer(job):
+    """The async_mode answer: the call runs in the background, the agent
+    polls job_status for the result (same pattern as the install chains)."""
+    return (f"Выполнение запущено ФОНОВЫМ ЗАДАНИЕМ (долгие вызовы не упираются "
+            f"в таймаут): id задания {job.id}.\nСтатус и результат: "
+            f"job_status(job_id=\"{job.id}\") — опрашивайте через 10–20 с; "
+            "этот вызов можно считать завершённым.")
 
 
 def _normalize_connection_arg(connection):
@@ -97,6 +119,28 @@ class RouterContext:
         self.timeout_s = timeout_s
         self._edt_cache = {}  # cwd -> (store_version, alias | None, resolution)
         self.jobs = jobs.JobRegistry()
+        self.ibsrv = ibsrv.IbsrvManager(home_dir, self.log)
+
+    def ensure_file_server(self, target):
+        """Start the file target's local ibsrv if needed; returns the target.
+
+        Routing to a file IB goes through the ibsrv publication, so a data
+        call must have the server up. The start is lazy (first call) and the
+        instance then stays up — there is no idle auto-stop. A port taken
+        since registration is reallocated and persisted in the record.
+        """
+        if not target.is_file:
+            return target
+        try:
+            state = self.ibsrv.start(target)
+        except ibsrv.IbsrvError:
+            # stored port taken meanwhile: reallocate once, then retry (a
+            # real failure — no binary, broken base — surfaces from retry)
+            target = self.store.set_ib_port(target.alias, ibsrv._free_port())
+            state = self.ibsrv.start(target)
+        if state.get("port") and state["port"] != target.ib_port:
+            target = self.store.set_ib_port(target.alias, state["port"])
+        return target
 
     def start_job(self, alias, kind, factory):
         """Launch a background chain job; returns the Job.
@@ -123,12 +167,52 @@ class RouterContext:
         asyncio.create_task(_run())
         return job
 
+    def start_data_job(self, name, arguments, base=None, cwd=None):
+        """Run an upstream data call as a background job; returns the Job.
+
+        The base resolves FIRST — a bad base refuses right here, no doomed
+        job (same fail-fast as the installer preflight). Parallel execute
+        jobs on one target are allowed (independent upstream calls tolerate
+        each other); an install/uninstall chain still refuses while any job
+        runs on the target (JobRegistry.running). The FULL upstream answer
+        lands in the job report — job_status returns it when done; a failed
+        call appends the classified error block and marks the job errored.
+        """
+        alias = self.resolve_target(base, cwd).alias
+        job = self.jobs.start(alias, jobs.KIND_EXECUTE)
+        self.log.write(f"job {job.id} -> {alias}: {jobs.KIND_EXECUTE} запущено")
+
+        def _run():
+            try:
+                answer = self.route_call(name, arguments, base=base, cwd=cwd,
+                                         timeout_s=ASYNC_TIMEOUT_S)
+                job.append(answer)
+                self.jobs.finish(job, jobs.STATUS_DONE)
+                self.log.write(f"job {job.id} -> {alias}: {jobs.KIND_EXECUTE} готово")
+            except Exception as exc:  # noqa: BLE001 — the job must not hang running
+                # route_call already wrapped transport errors into the
+                # classified block (AGENT_NOTE inside) — store it verbatim.
+                job.append(str(exc))
+                self.jobs.finish(job, jobs.STATUS_ERROR)
+                self.log.write(f"job {job.id} -> {alias}: {jobs.KIND_EXECUTE} "
+                               f"ОШИБКА: {str(exc)[:160]}")
+
+        threading.Thread(target=_run, daemon=True, name=f"job-{job.id}").start()
+        return job
+
     def _target_by_edt(self, resolution):
-        """Match a resolved cwd against the map: edt link first, then url."""
+        """Match a resolved cwd against the map: edt link, file, then url."""
         for target in self.store.snapshot():
             if target.edt and resolution.get("workspace") == target.edt.get("workspace") \
                     and resolution.get("project") == target.edt.get("project"):
                 return target
+        if resolution.get("file"):
+            wanted = os.path.normcase(os.path.abspath(resolution["file"]))
+            for target in self.store.snapshot():
+                if target.is_file and target.file_path \
+                        and os.path.normcase(os.path.abspath(target.file_path)) == wanted:
+                    return target
+            return None
         resolved_url = base_root(resolution.get("url") or "")
         for target in self.store.snapshot():
             if target.url == resolved_url:
@@ -182,24 +266,35 @@ class RouterContext:
             f"Доступные: {available}. Укажите base или работайте из каталога проекта EDT. "
             "Справка роутера — help_router.")
 
-    def route_call(self, name, arguments, base=None, cwd=None):
-        """Forward a tool call to the resolved target; log one line per call."""
+    def route_call(self, name, arguments, base=None, cwd=None, timeout_s=None):
+        """Forward a tool call to the resolved target; log one line per call.
+
+        timeout_s=None keeps the context default (sync tools); async data
+        jobs pass ASYNC_TIMEOUT_S — the agent polls job_status meanwhile.
+        """
+        timeout_s = self.timeout_s if timeout_s is None else timeout_s
         started = time.monotonic()
         try:
             target = self.resolve_target(base, cwd)
+            target = self.ensure_file_server(target)
+        except ibsrv.IbsrvError as exc:
+            self.log.write(f"{name} -> ?: сервер файловой базы не поднят: {exc}")
+            raise RuntimeError(str(exc)) from exc
         except RuntimeError as exc:
             self.log.write(f"{name} -> ?: ошибка: {str(exc)[:160]}")
             raise
         try:
             answer = forward.call_tool(target.mcp_url, name, arguments,
-                                       target.auth_headers(), self.timeout_s)
+                                       target.auth_headers(), timeout_s,
+                                       wa=target.auth_is_windows)
         except forward.TransportError as exc:
             elapsed = (time.monotonic() - started) * 1000
             self.log.write(f"{name} -> {target.alias}: ошибка: "
                            f"{forward.explain_short(exc)} ({elapsed:.0f} мс)")
             # One shared classification block (401/404/409/5xx/network) with
             # the "don't investigate, show the user" instruction inside.
-            raise RuntimeError(forward.explain_failure(exc)) from exc
+            raise RuntimeError(forward.explain_failure(
+                exc, wa=target.auth_is_windows)) from exc
         except RuntimeError as exc:
             elapsed = (time.monotonic() - started) * 1000
             self.log.write(f"{name} -> {target.alias}: ошибка: {str(exc)[:160]} ({elapsed:.0f} мс)")
@@ -248,6 +343,163 @@ def rsvdata_report(ctx):
         "этот бинарник её не меняет.",
     ]
     return "\n".join(lines)
+
+
+def _sanitize_alias(name):
+    """Alias-safe form of a directory name (letters/digits/._-, max 64)."""
+    return re.sub(r"[^A-Za-z0-9_.\-]", "_", str(name or "")).strip("_")[:64]
+
+
+def _file_target_alias(base, file_dir, existing):
+    """Alias + port for a file target record (existing record wins)."""
+    if existing and existing.is_file:
+        return existing.alias, existing.ib_port
+    if not base:
+        base = _sanitize_alias(os.path.basename(os.path.normpath(file_dir)))
+    if not base:
+        raise RuntimeError("Укажите base — алиас файловой базы "
+                           "(из имени каталога он не выводится).")
+    return base, None
+
+
+def _file_target_record(ctx, base, file_dir, existing, comment, edt_link, platform):
+    """Validate + persist a file target; returns (target, base, updated)."""
+    if not os.path.isdir(file_dir):
+        raise RuntimeError(f"Файловая база не найдена: {file_dir} (нужен каталог базы).")
+    base, port = _file_target_alias(base, file_dir, existing)
+    target, updated = ctx.store.register(
+        base, None, comment=comment, edt=edt_link, platform=platform,
+        connection=edt.normalize_connection({"File": file_dir}),
+        kind="file", file_path=file_dir, ib_port=port or ibsrv._free_port())
+    ctx.log.write(f"register_target -> {target.alias}: "
+                  f"{'обновлена' if updated else 'зарегистрирована'} файловая база {file_dir}")
+    return target, base, updated
+
+
+async def _file_target_check(ctx, target):
+    """Availability lines for a file target (starts ibsrv, then pings)."""
+    try:
+        target = await asyncio.to_thread(ctx.ensure_file_server, target)
+    except ibsrv.IbsrvError as exc:
+        return [f"Проверка связи пропущена: сервер ibsrv не поднят — {exc}"]
+    return list(await asyncio.to_thread(installer.availability_check, target))
+
+
+def _file_target_report(target, base, file_dir, source, updated):
+    """Human report lines for a just-registered file target."""
+    lines = [f"Файловая цель «{base}» {'обновлена' if updated else 'зарегистрирована'}: "
+             f"{file_dir} (адрес из {source}); локальная публикация — {target.url}."]
+    if target.edt:
+        lines.append(f"EDT-связь: {target.edt['project']} ({target.edt['workspace']}).")
+    if target.platform:
+        lines.append(f"Платформа: {target.platform}.")
+    lines.append("Файловую базу публикует локальный сервер ibsrv: он поднимается лениво "
+                 "(первое обращение или start_server), остановка — stop_server "
+                 "или при завершении роутера.")
+    return lines
+
+
+async def _file_install_step(ctx, target, install, check):
+    """Launch the install job for a file target: EDT first, ibcmd fallback."""
+    if not install:
+        return []
+    if not check:
+        return ["Установка расширения пропущена: check=False — ключ install "
+                "игнорируется."]
+    clash = ctx.jobs.running(target.alias)
+    if clash:
+        return [f"Установка НЕ запущена: для цели «{target.alias}» уже идёт "
+                f"задание {clash.id} ({clash.kind}, старт {clash.started}) — "
+                f"дождитесь его результата job_status(job_id=\"{clash.id}\")."]
+    go, refusal = await asyncio.to_thread(
+        installer.file_install_preflight, target,
+        getattr(ctx, "rsvdata_path", None), getattr(ctx, "rsv_mcp", ""))
+    if not go:
+        return refusal
+    job = ctx.start_job(target.alias, jobs.KIND_INSTALL,
+                        lambda j: asyncio.to_thread(
+                            installer.run_file_install_chain, ctx, target, j))
+    return [f"Установка расширения запущена ФОНОВЫМ ЗАДАНИЕМ (EDT или ibcmd): "
+            f"id задания {job.id}.",
+            f"Статус и построчный отчёт: job_status(job_id=\"{job.id}\") — "
+            "опрашивайте через 20–30 с; этот вызов можно считать завершённым."]
+
+
+async def _register_file_target(ctx, *, base, file_dir, existing, comment, edt_link,
+                                platform, check, install, source):
+    """Register or update a file-IB target and optionally check it."""
+    target, base, updated = _file_target_record(
+        ctx, base, file_dir, existing, comment, edt_link, platform)
+    lines = _file_target_report(target, base, file_dir, source, updated)
+    if check:
+        lines.extend(await _file_target_check(ctx, target))
+    else:
+        lines.append("Проверка связи пропущена (check=False).")
+    lines.extend(await _file_install_step(ctx, target, install, check))
+    lines.append("")
+    lines.append(BASIC_HELP.format(path=ctx.store.path, alias=base))
+    return "\n".join(lines)
+
+
+def _pick_file_target(ctx, base):
+    """Resolve base (or the single file target) to a file-IB Target."""
+    if base:
+        target = ctx.store.get(base)
+        if target is None:
+            available = ", ".join(ctx.store.aliases()) or "—"
+            raise RuntimeError(f"База «{base}» не зарегистрирована. Доступные: {available}.")
+    else:
+        files = [item for item in ctx.store.snapshot() if item.is_file]
+        if not files:
+            raise RuntimeError("Файловых целей нет — зарегистрируйте файловую базу: "
+                               'register_target(connection=\'File="<каталог>"\') '
+                               "или из проекта EDT (register_target с cwd).")
+        if len(files) > 1:
+            names = ", ".join(item.alias for item in files)
+            raise RuntimeError(f"Несколько файловых целей ({names}) — укажите base.")
+        target = files[0]
+    if not target.is_file:
+        raise RuntimeError(f"Цель «{target.alias}» — серверная база: локальный "
+                           "сервер ibsrv ей не нужен.")
+    return target
+
+
+async def _unregister_file_target(ctx, target, base, had_key):
+    """Removal job for a file target: EDT (or ibcmd) delete, then drop the record."""
+    go, refusal = await asyncio.to_thread(
+        installer.file_removal_preflight, target, getattr(ctx, "rsv_mcp", ""))
+    if not go:
+        ctx.log.write(f"unregister_target -> {base}: удаление не запущено "
+                      "(предпроверка ibcmd)")
+        return "\n".join(refusal)
+
+    def factory(job):
+        async def _run():
+            removed, _lines = await asyncio.to_thread(
+                installer.run_file_removal_chain, ctx, target, job)
+            if removed:
+                try:
+                    ctx.store.unregister(base)
+                except TargetError:
+                    pass  # unregistered concurrently — the goal state holds
+                job.append(f"Запись цели «{base}» удалена из мапы роутера.")
+                if had_key:
+                    job.append("Ключ цели удалён из keyring ОС.")
+                ctx.log.write(f"job -> {base}: расширение удалено (ibcmd), "
+                              "запись удалена")
+            else:
+                job.append(f"Запись цели «{base}» СОХРАНЕНА (доступ к базе и "
+                           "креды — для повторной попытки).")
+                ctx.log.write(f"job -> {base}: расширение НЕ удалено, "
+                              "запись сохранена")
+        return _run()
+
+    job = ctx.start_job(base, jobs.KIND_REMOVAL, factory)
+    return (f"Удаление расширения с файловой базы «{base}» запущено ФОНОВЫМ "
+            f"ЗАДАНИЕМ (EDT или ibcmd): id задания {job.id}.\n"
+            f"Статус и построчный отчёт: job_status(job_id=\"{job.id}\") — "
+            "опрашивайте через 20–30 с; по завершении запись цели будет удалена "
+            "автоматически вместе с ключом из keyring, либо сохранена с причиной.")
 
 
 def register_tools(app, ctx):
@@ -362,6 +614,9 @@ def register_tools(app, ctx):
         limit: int_arg("Максимум строк (по умолчанию 100, максимум 1000).") = None,
         base: str | None = None,
         cwd: str | None = None,
+        async_mode: bool_arg("ФОНОВЫЙ режим для долгих запросов (таймаут 30 минут "
+                             "вместо обычного): вызов уходит в задание, ответ — "
+                             "в отчёт job_status(job_id=...). По умолчанию false.") = False,
     ) -> str:
         """Выполнение готового запроса на языке запросов 1С — мощный путь:
         группировки и итоги, соединения, разыменование через точку, вложенные
@@ -369,9 +624,90 @@ def register_tools(app, ctx):
         Подробности и примеры: help topic=execute_query. base — алиас цели
         (без него — база из EDT по cwd (проект воркспейса), иначе единственная зарегистрированная цель).
         """
-        return ctx.route_call("execute_query", compact(query=query, parameters=parameters,
-                                                       limit=limit),
+        arguments = compact(query=query, parameters=parameters, limit=limit)
+        if async_mode:
+            job = ctx.start_data_job("execute_query", arguments, base=base, cwd=cwd)
+            return async_job_answer(job)
+        return ctx.route_call("execute_query", arguments, base=base, cwd=cwd)
+
+    @app.tool(name="read_binary")
+    def read_binary(
+        query: str_arg("Запрос на языке запросов 1С (только чтение), возвращающий РОВНО "
+                       "одну строку и одну колонку — значение типа ХранилищеЗначения "
+                       "(например Настройки варианта отчёта, картинка реквизита). "
+                       "Обязательный."),
+        parameters: dict_arg("Параметры запроса: имя -> значение (для &Имя в тексте). "
+                             "Даты — строкой ГГГГ-ММ-ДД.") = None,
+        maxBytes: int_arg("Предел размера блоба в байтах (по умолчанию 102400, максимум "
+                          "1048576). Блоб больше предела — отказ: частично двоичные "
+                          "данные не отдаются.") = None,
+        base: str | None = None,
+        cwd: str | None = None,
+    ) -> str:
+        """Точечное чтение ОДНОГО двоичного значения (реквизит типа ХранилищеЗначения,
+        например настройки варианта отчёта): возвращает сырой блоб в base64. Обычные
+        query/execute_query такие поля отдают представлением, а не данными.
+        Подробности и примеры: help topic=read_binary. base — алиас цели (без него —
+        база из EDT по cwd (проект воркспейса), иначе единственная зарегистрированная цель).
+        """
+        return ctx.route_call("read_binary", compact(query=query, parameters=parameters,
+                                                     maxBytes=maxBytes),
                               base=base, cwd=cwd)
+
+    @app.tool(name="evaluate_bsl")
+    def evaluate_bsl(
+        code: str_arg("Выражение на встроенном языке 1С (Вычислить) в серверном контексте "
+                      "базы. Доступна переменная Параметры — массив значений: "
+                      "Параметры[0], Параметры[1], ... Обязательный."),
+        parameters: Annotated[list[Any] | None, Field(
+            description="Массив значений произвольного типа — вход выражения.")] = None,
+        base: str | None = None,
+        cwd: str | None = None,
+        async_mode: bool_arg("ФОНОВЫЙ режим для долгих вычислений (таймаут 30 минут "
+                             "вместо обычного): вызов уходит в задание, ответ — "
+                             "в отчёт job_status(job_id=...). По умолчанию false.") = False,
+    ) -> str:
+        """Вычислить выражение на встроенном языке 1С (Вычислить) в серверном контексте
+        базы: глобальные функции, метаданные, проверки прав. Вход — массив Параметры;
+        ответ — значение выражения в JSON. Только при включённой константе «Включить
+        небезопасные методы» (иначе — отказ «Небезопасные методы отключены»); результат
+        НЕ проходит анонимизацию.
+        Подробности и примеры: help topic=evaluate_bsl. base — алиас цели (без него —
+        база из EDT по cwd (проект воркспейса), иначе единственная зарегистрированная цель).
+        """
+        arguments = compact(code=code, parameters=parameters)
+        if async_mode:
+            job = ctx.start_data_job("evaluate_bsl", arguments, base=base, cwd=cwd)
+            return async_job_answer(job)
+        return ctx.route_call("evaluate_bsl", arguments, base=base, cwd=cwd)
+
+    @app.tool(name="execute_bsl")
+    def execute_bsl(
+        code: str_arg("Код на встроенном языке 1С (Выполнить) в серверном контексте базы. "
+                      "Доступны переменные: Параметры — массив значений (вход); "
+                      "РезультатВыполнения — присвойте значение в коде, чтобы вернуть его "
+                      "в ответе (иначе ответ — «Выполнено»). Обязательный."),
+        parameters: Annotated[list[Any] | None, Field(
+            description="Массив значений произвольного типа — вход кода.")] = None,
+        base: str | None = None,
+        cwd: str | None = None,
+        async_mode: bool_arg("ФОНОВЫЙ режим для долгого кода (таймаут 30 минут вместо "
+                             "обычного): вызов уходит в задание, ответ — в отчёт "
+                             "job_status(job_id=...). По умолчанию false.") = False,
+    ) -> str:
+        """Выполнить код на встроенном языке 1С (Выполнить) в серверном контексте базы.
+        Вход — массив Параметры; чтобы вернуть результат, присвойте его переменной
+        РезультатВыполнения в коде (без него ответ — «Выполнено»). Только при включённой
+        константе «Включить небезопасные методы» (иначе — отказ «Небезопасные методы
+        отключены»); НЕ проходит анонимизацию.
+        Подробности и примеры: help topic=execute_bsl. base — алиас цели (без него —
+        база из EDT по cwd (проект воркспейса), иначе единственная зарегистрированная цель).
+        """
+        arguments = compact(code=code, parameters=parameters)
+        if async_mode:
+            job = ctx.start_data_job("execute_bsl", arguments, base=base, cwd=cwd)
+            return async_job_answer(job)
+        return ctx.route_call("execute_bsl", arguments, base=base, cwd=cwd)
 
     @app.tool(name="eventlog")
     def eventlog(
@@ -488,7 +824,8 @@ def register_tools(app, ctx):
                               base: str | None = None, comment: str | None = None,
                               cwd: str | None = None, check: bool = True,
                               install: bool = False,
-                              platform: str | None = None) -> str:
+                              platform: str | None = None,
+                              auth_mode: str | None = None) -> str:
         """Регистрация цели — базы 1С с опубликованным сервисом RSVData.
 
         Рекомендуемый порядок: если запущена EDT (доступен MCP:RSV) —
@@ -550,6 +887,11 @@ def register_tools(app, ctx):
           регистрируйте с cwd) -> конфигуратор (нужны данные авторизации в
           targets.json). Публикация базы для установки НЕ нужна — она
           требуется только для проверки.
+          Для ФАЙЛОВОЙ базы (kind=file) цепочка другая: расширение ставит
+          ibcmd (рядом с 1cv8.exe платформы базы) в два шага — load .cfe и
+          apply; локальный сервер ibsrv на время операции останавливается и
+          поднимается заново; креды — из keyring, если база с пользователями
+          (без них ibcmd на такой базе не работает).
           Перед запуском задания — предпроверка: если заранее известно,
           что ни один вариант не сработает (нет источника строки
           подключения — регистрация по url; или не определена версия
@@ -570,6 +912,13 @@ def register_tools(app, ctx):
           всегда выше; заданная явная ВЕРСИЯ перекрывает ibases.v8i
           (решение 23.09), явный ПУТЬ побеждает всё. Хранится в записи,
           чтобы uninstall=true позже взял то же значение.
+        auth_mode — тип авторизации цели: "basic" (по умолчанию: ключ в
+          keyring ОС), "windows" — Windows-аутентификация (запросы и
+          конфигуратор от учётной записи ОС процесса роутера, Negotiate/
+          NTLM и /WA+; только для серверных баз; требуется
+          pip install rsv-data-router[windows-auth] и настройка сервера),
+          "none" — явно без авторизации. Без аргумента (None) тип сохраняется
+          прежний; сам ключ (keyring) не трогается ни в каком случае.
 
         Логин/пароль через чат НЕ передаются: запись создаётся с пустым
         шаблоном basic, ключ задаётся командой пакета
@@ -579,6 +928,12 @@ def register_tools(app, ctx):
         existing = ctx.store.get(base) if base else None
         stored_connection = None
         connection_note = None
+        file_dir = edt.file_path(connection) if connection else None
+        if file_dir is None and existing is not None and existing.is_file:
+            # Re-registration of a file target without repeating the
+            # connection: keep it a file target (its directory IS the
+            # address), do not fall into the server-url branch.
+            file_dir = existing.file_path
         if existing:
             # Re-registration of a known alias: name, url and the EDT link
             # come from the STORED record (protects against a mistyped or
@@ -617,18 +972,23 @@ def register_tools(app, ctx):
                           '(строку подключения Srvr="...";Ref="...";) или '
                           "точное название базы из списка баз (параметр base).")
                 parts = edt.parse_connect(named_entry["connect"])
-                try:
-                    url = edt.upstream_url(parts)
-                except edt.EdtError as exc:
-                    raise RuntimeError(f"База «{base}» найдена в списке баз, "
-                                       f"но строка подключения не годится: "
-                                       f"{exc}") from exc
+                file_dir = edt.file_path(parts)
+                if not file_dir:
+                    try:
+                        url = edt.upstream_url(parts)
+                    except edt.EdtError as exc:
+                        raise RuntimeError(f"База «{base}» найдена в списке баз, "
+                                           f"но строка подключения не годится: "
+                                           f"{exc}") from exc
                 named_ref = parts.get("Ref")
                 source = "списка баз"
                 stored_connection = edt.normalize_connection(named_entry["connect"])
                 connection_note = "из списка баз"
             else:
-                url = resolution["url"]
+                if resolution.get("file"):
+                    file_dir = resolution["file"]
+                else:
+                    url = resolution["url"]
                 edt_link = {"workspace": resolution["workspace"],
                             "project": resolution["project"]}
                 source = "edt"
@@ -639,11 +999,24 @@ def register_tools(app, ctx):
             stored_connection = _normalize_connection_arg(connection)
             connection_note = "из параметра connection"
             parts = edt.parse_connect(connection)
-            try:
-                url = edt.upstream_url(parts)
-            except edt.EdtError as exc:
-                raise RuntimeError(f"Строка подключения не годится: {exc}") from exc
+            file_dir = edt.file_path(parts)
+            if not file_dir:
+                try:
+                    url = edt.upstream_url(parts)
+                except edt.EdtError as exc:
+                    raise RuntimeError(f"Строка подключения не годится: {exc}") from exc
             source = "connection"
+        if file_dir:
+            if auth_mode == "windows":
+                raise RuntimeError("auth_mode «windows» для файловой базы не "
+                                   "поддерживается — ibsrv публикует базу "
+                                   "локально; используйте Basic-ключ "
+                                   "(rsv-data-router set-secret) или снимите "
+                                   "auth_mode.")
+            return await _register_file_target(
+                ctx, base=base, file_dir=file_dir, existing=existing,
+                comment=comment, edt_link=edt_link, platform=platform,
+                check=check, install=install, source=source)
         if named_ref:
             # The caller used the list NAME as the address: the alias
             # becomes the Ref (the name itself breaks the alias rules and
@@ -688,7 +1061,8 @@ def register_tools(app, ctx):
                 raise RuntimeError("Укажите base — короткий алиас базы.")
         target, updated = ctx.store.register(base, url, comment=comment,
                                              edt=edt_link, platform=platform,
-                                             connection=stored_connection)
+                                             connection=stored_connection,
+                                             auth_mode=auth_mode)
         ctx.log.write(f"register_target -> {target.alias}: "
                       f"{'обновлена' if updated else 'зарегистрирована'} {target.url}")
         lines = [f"Цель «{base}» {'обновлена' if updated else 'зарегистрирована'}: {target.url}"
@@ -769,7 +1143,13 @@ def register_tools(app, ctx):
             # or both at once — same as the tail of the install chain.
             lines.extend(await asyncio.to_thread(installer.availability_check, target))
         kind = target.auth_kind()
-        if kind != "нет" and "пусто" not in kind:
+        if target.auth_is_windows:
+            lines.append("Авторизация: windows (SSPI) — запросы и конфигуратор идут "
+                         "от учётной записи ОС процесса роутера (Negotiate/NTLM, "
+                         "/WA+); ключ set-secret не используется. Если ключ "
+                         "авторизации когда-то задавался — не помешает, но можно "
+                         "убрать командой remove-secret.")
+        elif kind != "нет" and "пусто" not in kind:
             lines.append(f"Авторизация: {kind} (сохранена прежняя — при обновлении "
                          "не затирается; заменить — командой set-secret из справки ниже).")
         else:
@@ -842,6 +1222,8 @@ def register_tools(app, ctx):
             return (f"Удаление НЕ запущено: для цели «{base}» уже идёт задание "
                     f"{clash.id} ({clash.kind}, старт {clash.started}) — дождитесь "
                     f"его результата job_status(job_id=\"{clash.id}\").")
+        if target.is_file:
+            return await _unregister_file_target(ctx, target, base, had_key)
         go, refusal = await asyncio.to_thread(installer.preflight, target,
                                               remove=True)
         if not go:
@@ -896,6 +1278,10 @@ def register_tools(app, ctx):
         lines = [f"Цели роутера ({ctx.store.path}):"]
         for target in targets:
             line = f"  {target.alias} — {target.url} — auth: {target.auth_kind()}"
+            if target.is_file:
+                state = ctx.ibsrv.status(target.alias)
+                line += (f" — файловая: {target.file_path} "
+                         f"({'сервер работает' if state.get('running') else 'сервер остановлен'})")
             if target.edt:
                 line += f" — EDT: {target.edt['project']}"
             if target.comment:
@@ -907,7 +1293,8 @@ def register_tools(app, ctx):
             for target in targets:
                 try:
                     answer = forward.call_tool(target.mcp_url, "ping", {},
-                                               target.auth_headers(), CHECK_TIMEOUT_S)
+                                               target.auth_headers(), CHECK_TIMEOUT_S,
+                                               wa=target.auth_is_windows)
                     info = forward.parse_extension_info(answer)
                     if info:
                         lines.append(f"  {target.alias}: ок — расширение {info[0]}, "
@@ -926,6 +1313,51 @@ def register_tools(app, ctx):
                 lines.append("Подробности — ping по нужной цели; ответ покажите пользователю как есть.")
                 lines.append(forward.AGENT_NOTE)
         return "\n".join(lines)
+
+    @app.tool(name="start_server")
+    async def start_server(base: str | None = None) -> str:
+        """Запуск локального сервера ibsrv файловой базы (по команде).
+
+        Обычно вызывать не нужно: сервер поднимается лениво при первом
+        обращении к базе. Остановка — только явная (stop_server).
+        base — алиас файловой цели; без него — единственная файловая цель.
+        """
+        target = _pick_file_target(ctx, base)
+        try:
+            target = await asyncio.to_thread(ctx.ensure_file_server, target)
+        except ibsrv.IbsrvError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return (f"Сервер файловой базы «{target.alias}» запущен: {target.url}. "
+                f"Остановка — stop_server(base=\"{target.alias}\").")
+
+    @app.tool(name="stop_server")
+    def stop_server(base: str | None = None) -> str:
+        """Явная остановка локального сервера ibsrv файловой базы.
+
+        base — алиас файловой цели; без него — единственная файловая цель.
+        Пока сервер не остановлен, файловую базу нельзя открыть
+        конфигуратором/EDT/ibcmd — при необходимости остановите её здесь.
+        """
+        target = _pick_file_target(ctx, base)
+        if not ctx.ibsrv.is_running(target.alias):
+            return f"Сервер файловой базы «{target.alias}» уже остановлен."
+        ctx.ibsrv.stop(target.alias)
+        return f"Сервер файловой базы «{target.alias}» остановлен."
+
+    @app.tool(name="server_status")
+    def server_status(base: str | None = None) -> str:
+        """Состояние локального сервера ibsrv файловой базы.
+
+        base — алиас файловой цели; без него — единственная файловая цель.
+        """
+        target = _pick_file_target(ctx, base)
+        state = ctx.ibsrv.status(target.alias)
+        if not state.get("running"):
+            return (f"Сервер файловой базы «{target.alias}» не запущен "
+                    f"(база: {target.file_path}).")
+        return (f"Сервер файловой базы «{target.alias}» работает: pid {state.get('pid')}, "
+                f"адрес {state.get('url') or target.url}, "
+                f"платформа {target.platform or '—'}.")
 
     @app.tool(name="job_status")
     def job_status(

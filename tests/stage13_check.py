@@ -46,7 +46,8 @@ class FakeUpstream:
     def __init__(self):
         self.mode = "versioned"
 
-    def __call__(self, url, name, arguments, headers=None, timeout_s=None):
+    def __call__(self, url, name, arguments, headers=None, timeout_s=None,
+                 wa=False):
         if self.mode == "down":
             exc = forward.TransportError("HTTP 404 - not found")
             exc.status = 404
@@ -68,6 +69,7 @@ def make_target(**kwargs):
     target.mcp_url = target.url + "/hs/rsvdata/mcp"
     target.auth_headers = lambda: {}
     target.auth = {"type": "none"}
+    target.auth_is_windows = target.auth.get("type") == "windows"
     target.auth_kind = lambda: "нет"
 
     def _auth_value(t=target):

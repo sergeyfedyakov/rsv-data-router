@@ -14,6 +14,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from . import negotiate
+
 DEFAULT_TIMEOUT_S = 120
 
 # ping answer of RSVData 1.3.5+: "...; расширение 1.3.5, хеш <base64 SHA-1>".
@@ -55,17 +57,26 @@ def _clean_body(raw_body):
     return text if len(text) <= BODY_LIMIT else text[:BODY_LIMIT] + "…"
 
 
-def explain_failure(exc):
+def explain_failure(exc, wa=False):
     """Classify an upstream failure into a user-ready text block.
 
-    401 -> auth setup hint; 404 -> publication missing (told honestly);
-    409 -> extension/server version mismatch, server text verbatim (the user
-    decides what to do); 5xx -> web-server internal error; other -> raw
-    description. The block always ends with AGENT_NOTE.
+    401 -> auth setup hint (a wa target gets the Windows-auth checklist
+    instead of the set-secret hint); 404 -> publication missing (told
+    honestly); 409 -> extension/server version mismatch, server text
+    verbatim (the user decides what to do); 5xx -> web-server internal
+    error; other -> raw description. The block always ends with AGENT_NOTE.
     """
     status = getattr(exc, "status", None)
     body = _clean_body(getattr(exc, "body", None))
-    if status == 401:
+    if status == 401 and wa:
+        lines = [
+            "HTTP 401 — рукопожатие Windows-аутентификации (Negotiate/NTLM) не принято.",
+            "Проверьте на стороне сервера: публикация базы с включённой Windows-аутентификацией;",
+            "пользователь ИБ с «Аутентификация ОС», замапленный на учётную запись,",
+            "от которой запущен процесс роутера; веб-сервер и сервер 1С на одной машине",
+            "(без домена сквозная аутентификация ОС между машинами не работает).",
+        ]
+    elif status == 401:
         lines = [
             "HTTP 401 — база требует авторизацию, либо ключ не принят (неверный логин/пароль).",
             "Настройте ключ авторизации цели (логин/пароль через чат не передаются):",
@@ -120,13 +131,23 @@ def explain_short(exc):
     return "цель недоступна (сеть/веб-сервер не отвечает)"
 
 
-def post_json(url, body, headers=None, timeout_s=DEFAULT_TIMEOUT_S):
+def post_json(url, body, headers=None, timeout_s=DEFAULT_TIMEOUT_S, wa=False):
     """POST raw JSON bytes to the upstream, return (status, body_bytes).
+
+    wa=True routes through negotiate.post_json (Windows authentication:
+    Negotiate/NTLM legs under the router process's OS account) instead of a
+    pre-set Authorization header — for targets with auth.type "windows".
 
     Raises TransportError on network errors and on non-200 upstream status:
     1C answers JSON-RPC with HTTP 200, so anything else is an infrastructure
     error (401 wrong/no auth, 404 publication missing, 5xx web server).
     """
+    if wa:
+        try:
+            return negotiate.post_json(url, body, headers, timeout_s)
+        except negotiate.WaError as exc:
+            raise TransportError(str(exc), status=exc.status,
+                                 body=exc.body) from exc
     request = urllib.request.Request(url, data=body, method="POST")
     request.add_header("Content-Type", "application/json; charset=utf-8")
     request.add_header("Accept", "application/json, text/event-stream")
@@ -149,8 +170,11 @@ def post_json(url, body, headers=None, timeout_s=DEFAULT_TIMEOUT_S):
         raise TransportError(f"Цель недоступна: {url} ({exc})") from exc
 
 
-def call_tool(url, name, arguments, headers=None, timeout_s=DEFAULT_TIMEOUT_S):
+def call_tool(url, name, arguments, headers=None, timeout_s=DEFAULT_TIMEOUT_S,
+              wa=False):
     """Send a tools/call JSON-RPC to the upstream, return its text content.
+
+    wa=True — Windows authentication upstream (see post_json).
 
     Raises TransportError for network/HTTP failures; RuntimeError for a
     JSON-RPC error envelope (that error is already a meaningful answer, e.g.
@@ -165,7 +189,7 @@ def call_tool(url, name, arguments, headers=None, timeout_s=DEFAULT_TIMEOUT_S):
         "params": {"name": name, "arguments": arguments},
     }
     body = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    status, raw = post_json(url, body, headers, timeout_s)
+    status, raw = post_json(url, body, headers, timeout_s, wa=wa)
     try:
         answer = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:

@@ -56,9 +56,11 @@ async def run(url=None, home=None, ports=None, verbose=True):
         tools = sorted(t.name for t in await client.list_tools())
         check("tools list", tools == sorted([
             "ping", "config", "describe", "get_structure", "query", "execute_query",
-            "eventlog", "reveal", "help", "help_router", "get_rsvdata",
+            "evaluate_bsl", "execute_bsl",
+            "read_binary", "eventlog", "reveal", "help", "help_router", "get_rsvdata",
             "register_target", "unregister_target", "list_targets",
-            "update_targets", "job_status"]), tools)
+            "update_targets", "job_status", "start_server", "stop_server",
+            "server_status"]), tools)
 
         err, _ = await call(client, "ping", {})
         check("ping without targets -> instructive error",

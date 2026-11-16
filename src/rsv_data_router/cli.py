@@ -10,11 +10,24 @@ replace the former set_secret.ps1/set_secret.sh scripts:
 """
 
 import argparse
+import os
 import sys
 
 from . import __version__, credentials
 
 SECRET_COMMANDS = ("set-secret", "remove-secret")
+
+
+def _registered_target(alias):
+    """(target, store_path) for the alias, or (None, None) when the store
+    is unreadable/absent — secret commands keep working without a store."""
+    try:
+        from . import paths, targets
+        home = os.environ.get("RSV_DATA_ROUTER_HOME") or paths.default_home()
+        store = targets.TargetsStore(home)
+        return store.get(alias), store.path
+    except Exception:
+        return None, None
 
 
 def cmd_set_secret(argv):
@@ -26,6 +39,13 @@ def cmd_set_secret(argv):
                     "перезапуска.")
     parser.add_argument("alias", help="алиас цели из targets.json")
     args = parser.parse_args(argv)
+    target, store_path = _registered_target(args.alias)
+    if target is not None and target.auth_is_windows:
+        print(f"Цель «{args.alias}» работает через Windows-аутентификацию "
+              "(auth.type \"windows\") — ключ ей не нужен: запросы идут от "
+              "учётной записи ОС процесса роутера. Для Basic-ключа поменяйте "
+              f"auth.type на \"basic\" в {store_path} (или снимите секцию auth).")
+        return 1
     login, password = credentials.prompt_key()
     credentials.set_value(args.alias, credentials.encode_key(login, password))
     print(f"Готово: ключ цели «{args.alias}» сохранён в keyring "

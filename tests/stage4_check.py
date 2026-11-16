@@ -160,18 +160,25 @@ async def run(url=None, home=None, ports=None, verbose=True):
         edt.upstream_url({"File": "C:\\bases\\filebase"})
         check("upstream_url: file IB -> EdtError", False, "no exception")
     except edt.EdtError as exc:
-        check("upstream_url: file IB -> EdtError", "файловые" in str(exc))
+        check("upstream_url: file IB -> EdtError", "файловая" in str(exc))
+
+    check("file_path: File= -> base directory",
+          edt.file_path('File="C:\\bases\\filebase";') == "C:\\bases\\filebase",
+          edt.file_path('File="C:\\bases\\filebase";'))
+    check("normalize_connection: File -> File=\"path\";",
+          edt.normalize_connection('File="C:\\bases\\filebase";')
+          == 'File="C:\\bases\\filebase";',
+          edt.normalize_connection('File="C:\\bases\\filebase";'))
 
     resolved = edt.resolve(fixtures["cwds"]["app"], ibases_path=fixtures["ibases"])
     check("resolve: full chain for the app project",
           resolved and resolved["project"] == "Прикладка"
           and resolved["url"] == "http://cluster-host.demo/smoke_ref/hs/rsvdata/mcp",
           resolved)
-    try:
-        edt.resolve(fixtures["cwds"]["file"], ibases_path=fixtures["ibases"])
-        check("resolve: file IB raises EdtError", False, "no exception")
-    except edt.EdtError:
-        check("resolve: file IB raises EdtError", True)
+    resolved_file = edt.resolve(fixtures["cwds"]["file"], ibases_path=fixtures["ibases"])
+    check("resolve: file IB -> resolution with file directory",
+          resolved_file and resolved_file.get("file") == "C:\\bases\\filebase"
+          and "url" not in resolved_file, resolved_file)
 
     # Workspace root / plain subfolder / extension project: the main-config
     # project (the only one with a servable IB) must be found on its own.
@@ -247,8 +254,8 @@ async def run(url=None, home=None, ports=None, verbose=True):
               not err and f"mock{p1}" in text, err or text)
 
         err, text = await call(client, "ping", {"cwd": fixtures["cwds"]["file"]})
-        check("cwd of file-IB project -> clean 'not supported' error",
-              err and "файловые информационные базы не поддерживаются" in err, err)
+        check("cwd of an unregistered file-IB project -> falls back to the single target",
+              not err and f"mock{p1}" in text, err or text)
 
         # Workspace root: the project is derived, the reply says so.
         err, text = await call(client, "register_target", {

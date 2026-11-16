@@ -47,9 +47,11 @@ def root_answers(target):
     """(answers, detail): does anything HTTP answer at the publication root.
 
     Any status except 404 counts as an existing publication (401/403 are
-    the web server guarding it); 404 and network errors leave it unproven
-    — either no publication or a bare vdir without a default document.
-    detail is a short reason for the negative case.
+    the web server guarding it — for a wa target the bare 401 itself is
+    the proof, the Negotiate handshake is not needed to probe existence);
+    404 and network errors leave it unproven — either no publication or a
+    bare vdir without a default document. detail is a short reason for the
+    negative case.
     """
     request = urllib.request.Request(target.url, method="GET")
     for name, value in target.auth_headers().items():
@@ -85,7 +87,8 @@ def selfupdate(cfe_path, target, missing_line=None, short_errors=False,
         with open(cfe_path, "rb") as handle:
             body = handle.read()
         status, raw = forward.post_json(target.update_url, body,
-                                        target.auth_headers(), UPDATE_TIMEOUT_S)
+                                        target.auth_headers(), UPDATE_TIMEOUT_S,
+                                        wa=target.auth_is_windows)
     except forward.TransportError as exc:
         if getattr(exc, "status", None) == 404:
             return "next", [missing_line
@@ -95,7 +98,7 @@ def selfupdate(cfe_path, target, missing_line=None, short_errors=False,
             return "next", [f"Точка /update недоступна ({forward.explain_short(exc)}) — "
                             "установка пойдёт через EDT/конфигуратор."]
         return "stop", [forward.explain_short(exc) if short_errors
-                        else forward.explain_failure(exc)]
+                        else forward.explain_failure(exc, wa=target.auth_is_windows)]
     try:
         answer = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -194,8 +197,9 @@ def designer_branch(target, cfe_path, home):
     The stored key is OPTIONAL (user decision, 07.09): with none the
     configurator runs without /N /P (bases without users) and the report
     says so up front; a present-but-unreadable key refuses the variant.
-    Failures carry the /Out log tail AS IS — which markers matter is not
-    known yet, no classification."""
+    A windows target takes the /WA+ seam (no /N /P, see optional_login_
+    password). Failures carry the /Out log tail AS IS — which markers
+    matter is not known yet, no classification."""
     designer, version, note, refusal = _designer_for(target)
     if refusal:
         return False, [f"Вариант конфигуратора недоступен: {refusal}"]
@@ -206,16 +210,19 @@ def designer_branch(target, cfe_path, home):
         srvr, ref, ibase_name = update_designer.resolve_connection(target)
     except (SystemExit, RuntimeError) as exc:
         return False, [f"Вариант конфигуратора недоступен: {exc}"]
+    wa = target.auth_is_windows
     lines = [auth_note] if auth_note else []
     log_base = os.path.join(home, f".designer-{target.alias}")
     try:
         update_designer.run_designer(
             update_designer.build_command(designer, srvr, ref, login, password,
-                                          log_base + "-load.log", cfe_path, "load"),
+                                          log_base + "-load.log", cfe_path, "load",
+                                          wa=wa),
             log_base + "-load.log", "загрузка .cfe")
         update_designer.run_designer(
             update_designer.build_command(designer, srvr, ref, login, password,
-                                          log_base + "-update.log", cfe_path, "update"),
+                                          log_base + "-update.log", cfe_path, "update",
+                                          wa=wa),
             log_base + "-update.log", "обновление конфигурации БД расширения")
     except update_designer.DesignerError as exc:
         lines.append(f"Установка через конфигуратор не удалась: {exc}")
@@ -232,15 +239,26 @@ def designer_branch(target, cfe_path, home):
 
 
 def _auth_missing(target):
-    """True when no usable auth value is stored (neither inline nor keyring)."""
+    """True when no usable auth is configured (neither inline, nor keyring,
+    nor windows)."""
     return target.auth_kind() == "нет"
 
 
 def _auth_lines(target, header):
     """Failure lines for HTTP 401: the publication exists (the web server
-    challenged), the auth key is missing or rejected — next step: set-secret."""
+    challenged); a basic target is missing/rejecting its key (next step:
+    set-secret), a windows target failed the Negotiate/NTLM handshake
+    (next step: the server-side checklist)."""
     lines = [f"{header}: публикация есть, но база требует авторизацию (HTTP 401)."]
-    if _auth_missing(target):
+    if target.auth_is_windows:
+        lines.append("Цель работает через Windows-аутентификацию (Negotiate/NTLM, "
+                     "учётная запись ОС процесса роутера), рукопожатие не принято. "
+                     "Проверьте на стороне сервера: публикация с включённой "
+                     "Windows-аутентификацией; пользователь ИБ с «Аутентификация ОС», "
+                     "замапленный на учётную запись процесса роутера; веб-сервер и "
+                     "сервер 1С на одной машине (без домена сквозной переход учётной "
+                     "записи между машинами не работает).")
+    elif _auth_missing(target):
         lines.append("Данные авторизации не заданы. Следующий шаг — добавить ключ "
                      "(логин/пароль через чат не передаются):")
         lines.append(f"  rsv-data-router set-secret {target.alias}")
@@ -248,8 +266,7 @@ def _auth_lines(target, header):
         lines.append(f"Ключ авторизации не принят (неверный логин/пароль). "
                      f"Следующий шаг — обновить ключ цели «{target.alias}» "
                      "(rsv-data-router set-secret).")
-    lines.append("Ключ хранится в keyring ОС; перезапуск роутера не нужен. "
-                 "После добавления ключа повторить проверку: ping (base=<алиас>) "
+    lines.append("После устранения повторить проверку: ping (base=<алиас>) "
                  "или list_targets(check=true) — установка расширения при повторе "
                  "не требуется.")
     lines.append("")
@@ -269,7 +286,8 @@ def availability_check(target):
     """
     try:
         answer = forward.call_tool(target.mcp_url, "ping", {},
-                                   target.auth_headers(), 20)
+                                   target.auth_headers(), 20,
+                                   wa=target.auth_is_windows)
     except forward.TransportError as exc:
         status = getattr(exc, "status", None)
         if status == 401:
@@ -295,14 +313,19 @@ def availability_check(target):
                          "Следующий шаг: выполнить публикацию базы на веб-сервере с "
                          "сервисом rsvdata, затем повторить проверку: ping "
                          "(base=<алиас>) или list_targets(check=true)."]
-                if _auth_missing(target):
+                if target.auth_is_windows:
+                    lines.append("Аутентификация цели — Windows (SSPI): публикуйте "
+                                 "базу с включённой Windows-аутентификацией на "
+                                 "веб-сервере, а учётную запись процесса роутера "
+                                 "замапьте в пользователя ИБ с «Аутентификация ОС».")
+                elif _auth_missing(target):
                     lines.append("Данные авторизации тоже не заданы — добавить ключ "
                                  "(rsv-data-router set-secret <алиас>).")
             lines.append("")
             lines.append(forward.AGENT_NOTE)
             return lines
         return ["Проверка связи: НЕ ПРОШЛА (Запись сохранена).",
-                "", forward.explain_failure(exc)]
+                "", forward.explain_failure(exc, wa=target.auth_is_windows)]
     except RuntimeError as exc:
         return [f"Проверка связи: НЕ ПРОШЛА (Запись сохранена) — {exc}."]
     first = answer.splitlines()[0] if answer else "pong"
@@ -359,7 +382,8 @@ def preflight(target, remove=False, cfe_path=None):
     ping_version = None
     try:
         answer = forward.call_tool(target.mcp_url, "ping", {},
-                                   target.auth_headers(), PING_TIMEOUT_S)
+                                   target.auth_headers(), PING_TIMEOUT_S,
+                                   wa=target.auth_is_windows)
         ping_version = (forward.parse_extension_info(answer) or (None,))[0]
     except (forward.TransportError, RuntimeError):
         pass
@@ -489,7 +513,8 @@ def selfremove(target):
     """
     try:
         status, raw = forward.post_json(target.remove_url, b"",
-                                        target.auth_headers(), UPDATE_TIMEOUT_S)
+                                        target.auth_headers(), UPDATE_TIMEOUT_S,
+                                        wa=target.auth_is_windows)
     except forward.TransportError as exc:
         if getattr(exc, "status", None) == 404:
             return "next", ["Точки /remove нет (расширение старее 1.3.6) — "
@@ -691,16 +716,17 @@ def rsv_remove_branch(rsv_mcp, target):
 def _resolve_designer_ctx(target):
     """(ok, payload) for the configurator option, resolved UP FRONT (before
     /remove): ok=True carries (path, version, note, login, password,
-    auth_note, srvr, ref, name); ok=False carries the reason. Platform:
+    auth_note, srvr, ref, name, wa); ok=False carries the reason. Platform:
     auto sources first, the per-target platform key last, the SINGLE
     installed platform as the final substitute (with a note), refusal
     names the ask-the-user step. The auth key is OPTIONAL (user decision,
     07.09): login=None + a note when none is stored, refusal when a
-    present key is unreadable. Resolution touches only local files and
-    the OS keyring — nothing here needs the service, but the record (and
-    with it the stored credentials) goes away at the end of the chain, so
-    everything is read from the in-memory target before the destructive
-    step."""
+    present key is unreadable; a windows target (0.14.0) returns login=None
+    plus the wa flag — the command builds with /WA+ instead of /N /P.
+    Resolution touches only local files and the OS keyring — nothing here
+    needs the service, but the record (and with it the stored credentials)
+    goes away at the end of the chain, so everything is read from the
+    in-memory target before the destructive step."""
     designer, version, note, refusal = _designer_for(target)
     if refusal:
         return False, refusal
@@ -712,7 +738,7 @@ def _resolve_designer_ctx(target):
     except (SystemExit, RuntimeError) as exc:
         return False, str(exc)
     return True, (designer, version, note, login, password, auth_note,
-                  srvr, ref, ibase_name)
+                  srvr, ref, ibase_name, target.auth_is_windows)
 
 
 def designer_delete_branch(target, home, resolved):
@@ -723,13 +749,13 @@ def designer_delete_branch(target, home, resolved):
     if not ok:
         return False, [f"Вариант конфигуратора недоступен: {payload}"]
     (path, version, note, login, password, auth_note,
-     srvr, ref, ibase_name) = payload
+     srvr, ref, ibase_name, wa) = payload
     lines = [auth_note] if auth_note else []
     log_path = os.path.join(home, f".designer-{target.alias}-delete.log")
     try:
         update_designer.run_designer(
             update_designer.build_command(path, srvr, ref, login, password,
-                                          log_path, None, "delete"),
+                                          log_path, None, "delete", wa=wa),
             log_path, "удаление расширения")
     except update_designer.DesignerError as exc:
         lines.append(f"Удаление через конфигуратор не удалось: {exc}")
@@ -802,3 +828,357 @@ def run_removal_chain(ctx, target, sink=None):
     lines.extend(step)
     _emit(sink, step)
     return False, lines
+
+
+# ---- File infobase (kind=file): extension install/removal via ibcmd ----
+#
+# A file IB has no web publication to POST the .cfe to, and EDT is not
+# always available (the base may have no EDT project) — the router falls
+# back to ibcmd, the platform's stand-alone infobase utility. While ibsrv
+# holds the base (see ibsrv.py) no other tool can open it, so the chain
+# stops the instance first and starts it again after the install for the
+# availability check. ibcmd takes the base by --db-path and needs the
+# infobase credentials only when the base has users; stdin is closed on
+# every run — without credentials ibcmd prompts and loops instead of
+# failing once.
+
+IBCMD_BINARY_ENV = "RSV_DATA_ROUTER_IBCMD"
+IBCMD_TIMEOUT_S = 600
+
+
+class IbcmdError(RuntimeError):
+    """ibcmd failure carrying the output tail; returncode is None on timeout."""
+
+    def __init__(self, message, log_lines=(), returncode=None):
+        super().__init__(message)
+        self.log_lines = list(log_lines)
+        self.returncode = returncode
+
+
+def _read_output_tail(path, lines=40):
+    """Tail of an ibcmd output log; [] when absent/unreadable. ibcmd writes
+    in the console encoding (cp866/cp1251) — try utf-8 first."""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return []
+    for encoding in ("utf-8", "cp1251", "cp866"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("utf-8", "replace")
+    return [line for line in text.splitlines() if line.strip()][-lines:]
+
+
+def ibcmd_binary(version=None, roots=None):
+    """Path to ibcmd.exe next to the resolved 1cv8.exe.
+
+    RSV_DATA_ROUTER_IBCMD overrides the lookup (tests, exotic layouts). The
+    platform build is resolved exactly like the configurator and ibsrv.
+    """
+    override = os.environ.get(IBCMD_BINARY_ENV)
+    if override:
+        return override
+    designer = update_designer.find_designer(version, roots)
+    candidate = os.path.join(os.path.dirname(designer), "ibcmd.exe")
+    if not os.path.isfile(candidate):
+        raise SystemExit(f"рядом с конфигуратором нет ibcmd.exe: {candidate} — "
+                         "нужна полная установка платформы 8.3")
+    return candidate
+
+
+def _ibcmd_for(target):
+    """(binary, version, refusal) for a file target's ibcmd run.
+
+    RSV_DATA_ROUTER_IBCMD short-circuits the platform lookup (tests); the
+    real path resolves the base's build exactly like the configurator.
+    """
+    override = os.environ.get(IBCMD_BINARY_ENV)
+    if override:
+        return override, None, None
+    designer, version, _note, refusal = _designer_for(target)
+    if refusal:
+        return None, None, refusal
+    if designer and not os.path.isfile(designer):
+        return None, None, f"1cv8.exe не найден ({designer})."
+    candidate = os.path.join(os.path.dirname(designer), "ibcmd.exe")
+    if not os.path.isfile(candidate):
+        return None, None, f"рядом с конфигуратором нет ibcmd.exe: {candidate}."
+    return candidate, version, None
+
+
+def _ibcmd_base_args(target, login, password):
+    """Common ibcmd options: the file base plus the (optional) user. The key
+    is OPTIONAL like the configurator's: a base without users accepts a run
+    without --user/--password."""
+    args = ["config", "--db-path=" + target.file_path]
+    if login is not None:
+        args += ["--user=" + login, "--password=" + (password or "")]
+    return args
+
+
+def _run_ibcmd(binary, args, log_path, what, stdin_answer=None):
+    """One ibcmd invocation; output goes to log_path, the error carries a
+    bounded tail. stdin is closed by default: on a base with users and no
+    credentials ibcmd would prompt and loop instead of failing once. Some
+    commands (extension delete) ask a one-off confirmation that has no CLI
+    flag — stdin_answer feeds that answer ("y\\n") while still ending input.
+    """
+    kwargs = ({"stdin": subprocess.DEVNULL} if stdin_answer is None
+              else {"input": stdin_answer.encode("ascii")})
+    with open(log_path, "wb") as handle:
+        try:
+            proc = subprocess.run([binary] + args, stdout=handle,
+                                  stderr=subprocess.STDOUT,
+                                  timeout=IBCMD_TIMEOUT_S, **kwargs)
+        except subprocess.TimeoutExpired:
+            raise IbcmdError(
+                f"ibcmd ({what}) не уложился в {IBCMD_TIMEOUT_S} с — прерван; "
+                "проверьте журнал и состояние базы вручную",
+                _read_output_tail(log_path)) from None
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise IbcmdError(f"ibcmd ({what}) не запустился: {exc}") from None
+    if proc.returncode != 0:
+        raise IbcmdError(
+            f"ibcmd ({what}) завершился с кодом {proc.returncode}.",
+            _read_output_tail(log_path) or [f"(журнал {log_path} пуст или не создан)"],
+            proc.returncode)
+
+
+def _restart_ibsrv(ctx, target):
+    """Bring the target's ibsrv back after an ibcmd run (report lines)."""
+    try:
+        ctx.ensure_file_server(target)
+    except Exception as exc:  # noqa: BLE001 — report, never raise
+        return [f"Локальный сервер ibsrv поднять не удалось: {exc} — запустите "
+                "его вручную (start_server) перед работой с базой."]
+    return ["Локальный сервер ibsrv поднят заново — база снова опубликована."]
+
+
+def _edt_ready(rsv_mcp, target):
+    """True when the EDT route is configured at all for the target: an
+    MCP:RSV address plus a stored EDT link {workspace, project}. Whether the
+    project is actually open (and reachable) is only known when the branch
+    runs — the same best-effort as for server targets."""
+    return bool(rsv_mcp) and bool(target.edt)
+
+
+def file_install_preflight(target, cfe_path, rsv_mcp=""):
+    """(go, refusal_lines) for a file-target install, decided BEFORE the job.
+
+    The RSVData binary is precondition #0 (as for server targets). The route
+    is EDT first (by the target's EDT link) with ibcmd as the fallback, so a
+    job is created when EITHER route is configured; something is known-dead
+    only when the binary is missing or no route exists at all. Never raises.
+    """
+    if not (cfe_path and os.path.isfile(cfe_path)):
+        return False, [
+            "Установка НЕ запущена (фоновое задание не создавалось): бинарник "
+            "RSVData роутеру не выдан (--rsvdatabinary) — устанавливать нечем.",
+            "",
+            "Запустите роутер с --rsvdatabinary <путь к .cfe> и повторите "
+            "register_target(install=true, check=true).",
+        ]
+    if _edt_ready(rsv_mcp, target):
+        return True, []
+    _binary, _version, refusal = _ibcmd_for(target)
+    if refusal:
+        return False, [
+            "Установка НЕ запущена (фоновое задание не создавалось): ни EDT "
+            "(нет открытого проекта цели), ни ibcmd (не удалось определить "
+            "платформу файловой базы).", "", refusal]
+    return True, []
+
+
+def file_removal_preflight(target, rsv_mcp=""):
+    """(go, refusal_lines) for a file-target removal (no .cfe needed).
+
+    EDT first (by the target's EDT link), ibcmd fallback — same logic as the
+    install preflight."""
+    if _edt_ready(rsv_mcp, target):
+        return True, []
+    _binary, _version, refusal = _ibcmd_for(target)
+    if refusal:
+        return False, [
+            "Удаление НЕ запущено (фоновое задание не создавалось): ни EDT "
+            "(нет открытого проекта цели), ни ibcmd (не удалось определить "
+            "платформу файловой базы).", "", refusal]
+    return True, []
+
+
+def _finish_file_install(ctx, target, lines, sink):
+    """Restart the base's ibsrv and end the install report with a check."""
+    step = _restart_ibsrv(ctx, target)
+    lines += step
+    _emit(sink, step)
+    tail = availability_check(target)
+    lines += tail
+    _emit(sink, tail)
+    return lines
+
+
+def run_file_install_chain(ctx, target, sink=None):
+    """Install RSVData into a file IB; returns the report lines.
+
+    EDT (MCP:RSV, by the target's EDT link) is the primary route; a closed
+    or absent project quietly falls back to ibcmd. Both need the base to be
+    free, so a running ibsrv is stopped first and started again after the
+    install; an availability_check over the fresh publication ends the
+    report. Never raises; sink (job) receives every step's lines.
+    """
+    lines = ["Установка расширения RSVData на файловую базу "
+             "(сначала EDT по связи цели, затем ibcmd)…"]
+    _emit(sink, lines)
+    cfe_path = getattr(ctx, "rsvdata_path", None)
+    if not cfe_path or not os.path.isfile(cfe_path):
+        step = ["Бинарник RSVData роутеру не выдан (--rsvdatabinary) — "
+                "установка отменена."]
+        lines += step
+        _emit(sink, step)
+        return lines
+    if ctx.ibsrv.is_running(target.alias):
+        step = ["Локальный сервер ibsrv остановлен на время установки "
+                "(EDT и ibcmd требуют монопольного доступа к базе)."]
+        ctx.ibsrv.stop(target.alias)
+        lines += step
+        _emit(sink, step)
+    done, step = rsv_branch(getattr(ctx, "rsv_mcp", ""), target, cfe_path)
+    lines += step
+    _emit(sink, step)
+    if done:
+        return _finish_file_install(ctx, target, lines, sink)
+    binary, version, refusal = _ibcmd_for(target)
+    if refusal:
+        step = [f"ibcmd недоступен: {refusal}"]
+        lines += step
+        _emit(sink, step)
+        return _finish_file_install(ctx, target, lines, sink)
+    try:
+        login, password, auth_note = update_designer.optional_login_password(target)
+    except SystemExit as exc:
+        step = [f"ibcmd недоступен: {exc}"]
+        lines += step
+        _emit(sink, step)
+        return _finish_file_install(ctx, target, lines, sink)
+    if auth_note:
+        lines.append(auth_note)
+        _emit(sink, [auth_note])
+    log_base = os.path.join(ctx.home, f".ibcmd-{target.alias}")
+    base_args = _ibcmd_base_args(target, login, password)
+    try:
+        # --force: ibcmd asks «Принять изменения и продолжить обновление
+        # [y/n]» on warnings; with stdin closed (DEVNULL) that turns into
+        # «Операция не выполнена», so the confirmation is given up front.
+        _run_ibcmd(binary, base_args + ["load", "--extension=" + EXTENSION_NAME,
+                                        "--force",
+                                        update_designer.ascii_copy(cfe_path)],
+                   log_base + "-load.log", "загрузка .cfe")
+        _run_ibcmd(binary, base_args + ["apply", "--extension=" + EXTENSION_NAME,
+                                        "--force"],
+                   log_base + "-apply.log", "применение расширения")
+    except IbcmdError as exc:
+        step = [f"Установка через ibcmd не удалась: {exc}"]
+        step.extend(exc.log_lines)
+        lines += step
+        _emit(sink, step)
+        step = _restart_ibsrv(ctx, target)
+        lines += step
+        _emit(sink, step)
+        return lines
+    label = version or os.path.basename(binary)
+    step = [f"Расширение загружено и применено через ibcmd (платформа {label})."]
+    lines += step
+    _emit(sink, step)
+    return _finish_file_install(ctx, target, lines, sink)
+
+
+def run_file_removal_chain(ctx, target, sink=None):
+    """Remove RSVData from a file IB; returns (removed, lines).
+
+    EDT (MCP:RSV) is the primary route, ibcmd the fallback. Both need
+    exclusive access, so the instance is stopped and stays stopped (the
+    target record is dropped on success). Never raises.
+    """
+    lines = ["Удаление расширения RSVData с файловой базы "
+             "(сначала EDT по связи цели, затем ibcmd)…"]
+    _emit(sink, lines)
+    if ctx.ibsrv.is_running(target.alias):
+        step = ["Локальный сервер ibsrv остановлен — EDT и ibcmd требуют "
+                "монопольного доступа к базе (база останется остановленной)."]
+        ctx.ibsrv.stop(target.alias)
+        lines += step
+        _emit(sink, step)
+    kind, step = rsv_remove_branch(getattr(ctx, "rsv_mcp", ""), target)
+    lines += step
+    _emit(sink, step)
+    if kind == "done":
+        return True, lines
+    if kind == "pending":
+        step = ["Удаление выполняется в EDT в фоне. Запись цели СОХРАНЕНА; когда "
+                "EDT закончит, повторить unregister_target(base=..., "
+                "uninstall=true) — EDT дочитает результат (уже удалённое "
+                "расширение вернёт alreadyAbsent) и запись уберётся."]
+        lines += step
+        _emit(sink, step)
+        return False, lines
+    binary, version, refusal = _ibcmd_for(target)
+    if refusal:
+        step = [f"ibcmd недоступен: {refusal}"]
+        lines += step
+        _emit(sink, step)
+        return False, lines
+    try:
+        login, password, auth_note = update_designer.optional_login_password(target)
+    except SystemExit as exc:
+        step = [f"ibcmd недоступен: {exc}"]
+        lines += step
+        _emit(sink, step)
+        return False, lines
+    if auth_note:
+        lines.append(auth_note)
+        _emit(sink, [auth_note])
+    log_path = os.path.join(ctx.home, f".ibcmd-{target.alias}-delete.log")
+    base_args = _ibcmd_base_args(target, login, password)
+    delete_args = base_args + ["extension", "delete", "--name=" + EXTENSION_NAME]
+    try:
+        try:
+            # Deleting an extension asks a one-off «Принять изменения и
+            # продолжить обновление [y/n]» that has no CLI flag — feed the
+            # answer (every other ibcmd run keeps stdin closed).
+            _run_ibcmd(binary, delete_args, log_path, "удаление расширения",
+                       stdin_answer="y\n")
+        except IbcmdError as exc:
+            tail = "\n".join(exc.log_lines)
+            if "содержит данные" not in tail:
+                raise
+            # The platform refuses to delete an extension that is ACTIVE and
+            # holds data («…активно и содержит данные… только после снятия
+            # признака активности») — deactivate it first, then delete again.
+            step = ["Расширение активно и содержит данные — снимаю признак "
+                    "активности и повторяю удаление."]
+            lines += step
+            _emit(sink, step)
+            _run_ibcmd(binary, base_args + ["extension", "update",
+                                            "--name=" + EXTENSION_NAME,
+                                            "--active=no"],
+                       os.path.join(ctx.home, f".ibcmd-{target.alias}-deactivate.log"),
+                       "снятие признака активности")
+            _run_ibcmd(binary, delete_args, log_path, "удаление расширения",
+                       stdin_answer="y\n")
+    except IbcmdError as exc:
+        step = [f"Удаление через ibcmd не удалось: {exc}"]
+        step.extend(exc.log_lines)
+        step.append("Если расширения RSVData на базе нет, удалите только запись "
+                    "цели: unregister_target(base=..., uninstall=false).")
+        lines += step
+        _emit(sink, step)
+        return False, lines
+    label = version or os.path.basename(binary)
+    step = [f"Расширение удалено через ibcmd (платформа {label})."]
+    lines += step
+    _emit(sink, step)
+    return True, lines

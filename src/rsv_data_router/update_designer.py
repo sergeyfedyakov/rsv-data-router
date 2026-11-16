@@ -235,8 +235,17 @@ def optional_login_password(target):
     a missing key degrades to login=None plus a hint note instead of
     refusing the variant. A key that is PRESENT but unreadable still
     refuses — the operator meant it to be used: «данные авторизации
-    повреждены, установите заново». The result never leaves this
-    function's callers except as configurator/ping arguments."""
+    повреждены, установите заново». A windows target (auth.type "windows")
+    takes the OS-auth seam directly: login=None and the note says /WA+ —
+    any stored key (inline or stale keyring entry) is ignored. The result
+    never leaves this function's callers except as configurator/ping
+    arguments."""
+    if target.auth_is_windows:
+        return None, None, (
+            f"Цель «{target.alias}»: Windows-аутентификация — конфигуратор "
+            "пойдёт с /WA+ без /N /P, от учётной записи ОС процесса роутера "
+            "(она должна быть замаплена в пользователя ИБ с правами на "
+            "расширение).")
     if not target.auth_value():
         return None, None, (
             f"Цель «{target.alias}»: ключ авторизации не задан — конфигуратор "
@@ -309,15 +318,17 @@ def ascii_copy(cfe_path):
 
 
 def build_command(designer, srvr, ref, login, password, log_path, cfe_path,
-                  phase):
+                  phase, wa=False):
     """Raw command line with docs-style quoting for one phase ("load",
     "update" or "delete"). The designer parses its own command line the
     way .bat examples show it: the connection string value is quoted,
     inner quotes doubled. login=None (no stored key — user decision,
     07.09) omits /N /P entirely: bases without users accept such runs
-    (docs: /P may be dropped when the user has no password), and this is
-    the seam a future OS-auth key will build on (/WA+). The result is
-    never printed in full: masked_command() hides login/password.
+    (docs: /P may be dropped when the user has no password). wa=True
+    (target auth.type "windows", 0.14.0) uses that same seam explicitly:
+    " /WA+" instead of /N /P — the designer authenticates via the OS
+    account of its own process. The result is never printed in full:
+    masked_command() hides login/password.
     "delete" (/DeleteCfg -Extension) needs no .cfe: it removes the
     extension straight from the infobase (exit code 1 also means
     "extension absent" — per the batch-mode docs)."""
@@ -327,7 +338,12 @@ def build_command(designer, srvr, ref, login, password, log_path, cfe_path,
         batch = f' /DeleteCfg -Extension "{EXT_NAME}"'
     else:
         batch = f' /UpdateDBCfg -Extension "{EXT_NAME}"'
-    auth = f' /N "{login}" /P "{password}"' if login is not None else ""
+    if wa:
+        auth = " /WA+"
+    elif login is not None:
+        auth = f' /N "{login}" /P "{password}"'
+    else:
+        auth = ""
     return (
         f'"{designer}" DESIGNER'
         " /DisableStartupDialogs /DisableStartupMessages"
@@ -403,15 +419,17 @@ def run_designer(command, log_path, what):
     print(f"Конфигуратор ({what}): успех (код 0).")
 
 
-def ping_extension(url, login, password):
+def ping_extension(url, login, password, wa=False):
     """Direct tools/call ping (same shape as forward.call_tool). With no
     stored key (login=None) it goes without an Authorization header —
-    publications open for anonymous answer regardless."""
+    publications open for anonymous answer regardless. wa=True (target
+    auth.type "windows") routes through the Negotiate/NTLM transport: the
+    header is not enough for such publications, the handshake is."""
     headers = None
     if login is not None:
         headers = {"Authorization": "Basic " + base64.b64encode(
             f"{login}:{password}".encode("utf-8")).decode("ascii")}
-    return forward.call_tool(url, "ping", {}, headers=headers)
+    return forward.call_tool(url, "ping", {}, headers=headers, wa=wa)
 
 
 def version_from_ping(text):
@@ -436,6 +454,7 @@ def main():
                          f"Доступные: {', '.join(store.aliases())}")
 
     print(f"Цель: {target.alias} ({target.url}); ключ: {target.auth_kind()}")
+    wa = target.auth_is_windows
     login, password, auth_note = optional_login_password(target)
     if auth_note:
         print(auth_note)
@@ -458,7 +477,7 @@ def main():
     print(f"Расширение: {args.cfe} ({size} байт)")
 
     try:
-        text = ping_extension(target.url, login, password)
+        text = ping_extension(target.url, login, password, wa=wa)
     except (forward.TransportError, RuntimeError) as exc:
         raise SystemExit(f"Предварительный ping не прошёл, обновление отменено: {exc}")
     was = version_from_ping(text)
@@ -466,17 +485,17 @@ def main():
 
     run_designer(build_command(designer, srvr, ref, login, password,
                                log_base + "-load.log", os.path.abspath(args.cfe),
-                               "load"),
+                               "load", wa=wa),
                  log_base + "-load.log", "загрузка .cfe")
     run_designer(build_command(designer, srvr, ref, login, password,
                                log_base + "-update.log", os.path.abspath(args.cfe),
-                               "update"),
+                               "update", wa=wa),
                  log_base + "-update.log", "обновление конфигурации БД расширения")
 
     print(f"Пауза {args.wait_seconds} с (пул HTTP-сеансов дорабатывает старым кодом)…")
     time.sleep(args.wait_seconds)
     try:
-        text = ping_extension(target.url, login, password)
+        text = ping_extension(target.url, login, password, wa=wa)
     except (forward.TransportError, RuntimeError) as exc:
         print_log_tail(log_base + "-update.log")
         raise SystemExit(f"Загрузка прошла, но контрольный ping не удался: {exc}")

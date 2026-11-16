@@ -25,8 +25,11 @@ Chain (verified against real workspaces):
 Connect strings may embed Usr=/Pwd= — they are dropped here and never reach
 logs or errors: router auth lives in targets.json.
 
-File-based IBs are NOT supported (no web publication to point at): use the
-existing COM bridge for those until automated publication exists.
+File-based IBs have no publication of their own, so instead of a URL the
+resolution carries the base DIRECTORY (`file`). The router publishes such a
+base locally with the stand-alone server `ibsrv` (see ibsrv.py) and then
+talks to it over the usual HTTP transport; the per-target address is
+allocated there. Server IBs are unchanged.
 """
 
 import json
@@ -315,39 +318,52 @@ def parse_connect(connect):
     return result
 
 
-def normalize_connection(connect):
-    """Raw Connect string or parsed dict -> 'Srvr="host:port";Ref="ref";'.
+def file_path(connect):
+    """Base DIRECTORY of a file IB from a Connect string/dict, or None.
 
-    The form stored in the target record so the configurator can reconnect
-    without an EDT link. The cluster port (and a comma-separated server
-    list) in Srvr is kept verbatim — one web server may front several
-    clusters, so the port cannot be derived from the publication url.
-    Everything but Srvr/Ref (Usr/Pwd and other keys) is dropped — no
-    credentials in targets.json. File IBs are rejected with the same hint
-    as upstream_url.
+    Accepts the raw ibases form File="D:\\bases\\x" (or a parsed dict) and
+    returns the path with the surrounding quotes stripped. None for server
+    connects (Srvr/Ref) and for an empty File value.
+    """
+    parts = parse_connect(connect) if isinstance(connect, str) else dict(connect or {})
+    path = str(parts.get("File", "")).strip()
+    return path or None
+
+
+def normalize_connection(connect):
+    """Raw Connect string or parsed dict -> the stored connection form.
+
+    Server IB -> 'Srvr="host:port";Ref="ref";' — the configurator's
+    reconnect string without an EDT link. The cluster port (and a
+    comma-separated server list) in Srvr is kept verbatim — one web server
+    may front several clusters, so the port cannot be derived from the
+    publication url. File IB -> 'File="<path>";' — the directory of the
+    base, published locally by ibsrv. Everything but Srvr/Ref/File
+    (Usr/Pwd and other keys) is dropped — no credentials in targets.json.
     """
     parts = parse_connect(connect) if isinstance(connect, str) else dict(connect)
-    if parts.get("File"):
-        raise EdtError(
-            "файловые информационные базы не поддерживаются (нет веб-публикации); "
-            "для файлового варианта используйте COM-мост")
+    base_dir = str(parts.get("File", "")).strip()
+    if base_dir:
+        return f'File="{base_dir}";'
     srvr = parts.get("Srvr", "").strip()
     ref = parts.get("Ref", "").strip()
     if not srvr or not ref:
-        raise EdtError("строка подключения без Srvr/Ref — сохранить её нельзя")
+        raise EdtError("строка подключения без Srvr/Ref или File — сохранить её нельзя")
     return f'Srvr="{srvr}";Ref="{ref}";'
 
 
 def upstream_url(connect):
-    """Connection parts -> rsvdata publication URL; raises EdtError otherwise.
+    """Server connection parts -> rsvdata publication URL; raises otherwise.
 
     Cluster port is dropped (the web publication lives on the plain HTTP
-    host), Usr/Pwd are ignored. File IBs are rejected with a hint.
+    host), Usr/Pwd are ignored. A file IB has no publication of its own:
+    its address is the local ibsrv publication, allocated by the router
+    (ibsrv.py), so this function refuses File with a pointer there.
     """
     if connect.get("File"):
         raise EdtError(
-            "файловые информационные базы не поддерживаются (нет веб-публикации); "
-            "для файлового варианта используйте COM-мост")
+            "файловая база: веб-публикации нет — адрес даёт локальный сервер "
+            "ibsrv, роутер выделяет его сам (см. register_target)")
     srvr, ref = connect.get("Srvr", ""), connect.get("Ref", "")
     if not srvr or not ref:
         raise EdtError("строка подключения без Srvr/Ref — не удалось построить URL")
@@ -374,16 +390,29 @@ def read_ibases(path):
         raise EdtError(f"не удалось прочитать список баз EDT ({path}): {exc}") from exc
 
 
+def _resolution(workspace, project, uuid, entry):
+    """ibases entry -> resolution dict (url for server IBs, file for file IBs)."""
+    connect = parse_connect(entry["connect"])
+    result = {"workspace": workspace, "project": project, "uuid": uuid,
+              "name": entry["name"], "connect": connect}
+    base_dir = file_path(connect)
+    if base_dir:
+        result["file"] = base_dir
+    else:
+        result["url"] = upstream_url(connect)
+    return result
+
+
 def resolve(cwd, ibases_path=None):
     """Full chain cwd -> resolution dict or None (nothing EDT-ish found).
 
     The project is taken from the cwd path when it carries its own
     association. Otherwise (cwd at the workspace root, a plain subfolder or
     an extension project — extensions have no association of their own) the
-    workspace is scanned for the main-configuration project: the single one
-    whose association resolves to a server IB. Zero candidates -> None,
-    several -> EdtError listing them, the only candidate being a file IB ->
-    the loud file-IB error.
+    workspace is scanned for the main-configuration project. A resolution
+    carries `url` for a server IB or `file` (base directory) for a file IB —
+    the router publishes the latter locally via ibsrv. Zero candidates ->
+    None, several -> EdtError listing them.
     """
     located = locate(cwd)
     if not located:
@@ -399,28 +428,22 @@ def resolve(cwd, ibases_path=None):
     if project:
         uuid, entry = entry_for(project)
         if entry:
-            connect = parse_connect(entry["connect"])
-            return {"workspace": workspace, "project": project, "uuid": uuid,
-                    "name": entry["name"], "connect": connect,
-                    "url": upstream_url(connect)}
+            return _resolution(workspace, project, uuid, entry)
 
     # No project in cwd or it has no resolvable IB of its own: scan the
-    # workspace for the one project we can serve.
-    found, file_error = [], None
+    # workspace. Server candidates win the automatic pick — a file IB in the
+    # same workspace only answers when it is the sole candidate (the agent
+    # normally points at a file project with cwd instead).
+    server, files = [], []
     bases = read_ibases(path)
     for name in list_projects(workspace):
         uuid = infobase_uuid(workspace, name)
         entry = bases.get(uuid) if uuid else None
         if not entry:
             continue
-        connect = parse_connect(entry["connect"])
-        try:
-            url = upstream_url(connect)
-        except EdtError as exc:
-            file_error = file_error or exc
-            continue
-        found.append({"workspace": workspace, "project": name, "uuid": uuid,
-                      "name": entry["name"], "connect": connect, "url": url})
+        resolution = _resolution(workspace, name, uuid, entry)
+        (files if "file" in resolution else server).append(resolution)
+    found = server or files
     if len(found) == 1:
         found[0]["auto_project"] = True
         return found[0]
@@ -428,6 +451,4 @@ def resolve(cwd, ibases_path=None):
         names = ", ".join(sorted(r["project"] for r in found))
         raise EdtError(f"в воркспейсе несколько проектов с базами ({names}) — "
                        "укажите cwd нужного проекта")
-    if file_error:
-        raise file_error
     return None

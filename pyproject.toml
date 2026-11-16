@@ -15,6 +15,12 @@ dependencies = [
     "keyring>=25",
 ]
 
+[project.optional-dependencies]
+# Windows authentication targets (auth.type "windows"): SSPI tokens for the
+# Negotiate/NTLM handshake in negotiate.py (sspilib is the primary backend,
+# pyspnego the cross-platform fallback). Base install stays without it.
+windows-auth = ["pyspnego>=0.10", "sspilib>=0.6; sys_platform == 'win32'"]
+
 [project.scripts]
 rsv-data-router = "rsv_data_router.cli:main"
 

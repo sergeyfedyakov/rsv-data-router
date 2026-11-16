@@ -21,3 +21,4 @@ entry.py
 # Local-only artifacts
 bin/
 tests/spike_gilev.py
+tests/spike_binary.py

@@ -35,6 +35,9 @@ import stage11_check  # noqa: E402
 import stage12_check  # noqa: E402
 import stage13_check  # noqa: E402
 import stage14_check  # noqa: E402
+import stage15_check  # noqa: E402
+import stage16_check  # noqa: E402
+import stage17_check  # noqa: E402
 
 SMOKE_HOME = os.path.join(ROOT, ".smoke-home")
 
@@ -112,7 +115,8 @@ def main():
         for module in (stage2_check, stage3_check, stage4_check, stage5_check,
                        stage6_check, stage7_check, stage8_check, stage9_check,
                        stage10_check, stage11_check, stage12_check,
-                       stage13_check, stage14_check):
+                       stage13_check, stage14_check, stage15_check,
+                       stage16_check, stage17_check):
             print(f"--- {module.__name__} ---")
             passed, failed = asyncio.run(module.run(url, SMOKE_HOME, (p1, p2)))
             print(f"{module.__name__}: {passed} passed, {failed} failed")

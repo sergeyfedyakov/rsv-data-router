@@ -53,11 +53,13 @@ async def run(url=None, home=None, ports=None, verbose=True):
 
     async with Client(url) as client:
         expected = sorted(["ping", "config", "describe", "get_structure", "query",
-                           "execute_query", "eventlog", "reveal", "help", "help_router",
-                           "get_rsvdata", "register_target", "unregister_target",
-                           "list_targets", "update_targets", "job_status"])
+                           "execute_query", "read_binary", "eventlog", "reveal", "help",
+                           "help_router", "get_rsvdata", "register_target",
+                           "unregister_target", "list_targets", "update_targets",
+                           "job_status", "start_server", "stop_server", "server_status",
+                           "evaluate_bsl", "execute_bsl"])
         tools = sorted(t.name for t in await client.list_tools())
-        check("16 tools in registry", tools == expected, tools)
+        check("22 tools in registry", tools == expected, tools)
 
         err, _ = await call(client, "register_target", {
             "url": f"http://127.0.0.1:{p1}/mcp", "base": "mock1", "comment": "этап 3"})
@@ -108,6 +110,14 @@ async def run(url=None, home=None, ports=None, verbose=True):
         args = parse_echo(text)
         check("execute_query passes args",
               not err and args and args.get("parameters") == {"Парам": "x"}, err or text)
+
+        err, text = await call(client, "read_binary", {
+            "query": "ВЫБРАТЬ ПЕРВЫЕ 1 Настройки КАК Значение ИЗ Справочник.ВариантыОтчетов",
+            "parameters": {"Имя": "ОбщиеНастройки"}, "maxBytes": 2048, "base": "mock1"})
+        args = parse_echo(text)
+        check("read_binary passes args",
+              not err and args and args.get("parameters") == {"Имя": "ОбщиеНастройки"}
+              and args.get("maxBytes") == 2048, err or text)
 
         err, text = await call(client, "eventlog", {
             "from": "2026-01-01", "to": "2026-01-31", "levels": ["Error", "Warning"], "base": "mock1",

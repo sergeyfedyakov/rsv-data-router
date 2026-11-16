@@ -14,17 +14,23 @@ HTTP-сервис MCP (чтение данных и структура мета�
   лежит `cwd`, иначе берётся единственная зарегистрированная цель;
 - логин/пароль **не передаются через чат**: ключ хранится в keyring ОС
   (Windows Credential Manager / Secret Service) и подхватывается на лету;
+- базы с **Windows-аутентификацией** (0.14.0): цель `auth.type "windows"` —
+  запросы через Negotiate/NTLM (SSPI учётной записи процесса роутера),
+  конфигуратор с `/WA+`; требуется `pip install "rsv-data-router[windows-auth]"`;
 - установка/обновление/удаление расширения на базах — фоновыми цепочками
-  (точка `/update` → EDT → конфигуратор) прямо из диалога;
+  (точка `/update` → EDT → конфигуратор; для файловых баз — EDT → `ibcmd`,
+  без публикации) прямо из диалога;
 - журнал всех вызовов — `router.log` (инструмент, цель, статус, длительность).
 
 ```
 ИИ-клиент (одна запись: rsvdata → http://127.0.0.1:8780/mcp)
   └─ роутер (FastMCP: stateless HTTP + stdio)
-       ├─ 9 инструментов данных — форвард в выбранную базу (+ base/cwd)
-       ├─ 7 служебных — register_target / unregister_target / list_targets /
-       │                update_targets / job_status / get_rsvdata / help_router
-       └─ targets.json: алиас → {url, auth, edt?, platform?, connection?, comment}
+       ├─ 10 инструментов данных — форвард в выбранную базу (+ base/cwd)
+       ├─ 10 служебных — register_target / unregister_target / list_targets /
+       │                 update_targets / job_status / get_rsvdata / help_router /
+       │                 start_server / stop_server / server_status
+       └─ targets.json: алиас → {url | kind=file+file_path, auth, edt?, platform?,
+                                connection?, comment?}
 ```
 
 ## Требования и установка

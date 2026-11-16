@@ -16,6 +16,7 @@ import uuid
 
 KIND_INSTALL = "установка"
 KIND_REMOVAL = "удаление"
+KIND_EXECUTE = "выполнение"
 
 STATUS_RUNNING = "выполняется"
 STATUS_DONE = "готово"
@@ -61,6 +62,11 @@ class Job:
         return end - self._started_mono
 
     def _finish(self, status):
+        # First finish wins: a body that finished its own job (data jobs
+        # classify the upstream answer themselves) must not be overwritten
+        # by the outer runner's blanket "done".
+        if self._finished_mono is not None:
+            return
         self._finished_mono = time.monotonic()
         self.status = status
 
